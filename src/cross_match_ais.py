@@ -138,7 +138,7 @@ def run_cross_matching():
             sorted_pts = group.sort_values("timestamp")
             trajectory = LineString(sorted_pts.geometry.tolist())
 
-        dist_meters = trajectory.distance(spill_geom_metric)
+        dist_meters = trajectory.distance(spill_geom_metric.centroid)
         suspects.append({
             "mmsi": int(mmsi),
             "vessel_name": group["vessel_name"].iloc[0],

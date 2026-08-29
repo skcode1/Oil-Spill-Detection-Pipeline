@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+import math
 import yaml
 import subprocess
 import shutil
@@ -34,7 +35,68 @@ map_cfg = config.get("map_dashboard", {}) or {}
 DEFAULT_LAT = map_cfg.get("center_lat", 13.0827)
 DEFAULT_LON = map_cfg.get("center_lon", 80.2707)
 DEFAULT_ZOOM = map_cfg.get("initial_zoom", 9)
-MAPBOX_STYLE = map_cfg.get("mapbox_style", "carto-positron")
+
+
+def resolve_map_style(style_name):
+    if not style_name:
+        return "dark_no_labels"
+    style_name = str(style_name).strip()
+    if style_name.startswith("mapbox://"):
+        return style_name
+    valid_aliases = {
+        "carto-positron": "light_no_labels",
+        "carto_positron": "light_no_labels",
+        "carto-darkmatter": "dark_no_labels",
+        "carto_darkmatter": "dark_no_labels",
+        "dark": "dark_no_labels",
+        "light": "light_no_labels",
+        "light_no_labels": "light_no_labels",
+        "dark_no_labels": "dark_no_labels",
+        "satellite": "mapbox://styles/mapbox/satellite-streets-v12",
+        "satellite-streets": "mapbox://styles/mapbox/satellite-streets-v12",
+    }
+    return valid_aliases.get(style_name.lower(), "dark_no_labels")
+
+
+def compute_event_view(spill_gdf=None, culprit_gdf=None):
+    center_lat, center_lon = DEFAULT_LAT, DEFAULT_LON
+    zoom = DEFAULT_ZOOM
+
+    candidates = []
+    if spill_gdf is not None and not spill_gdf.empty:
+        candidates.append(spill_gdf)
+    if culprit_gdf is not None and not culprit_gdf.empty:
+        candidates.append(culprit_gdf)
+
+    if candidates:
+        all_bounds = []
+        for gdf in candidates:
+            try:
+                all_bounds.append(gdf.total_bounds)
+            except Exception:
+                pass
+        if all_bounds:
+            merged = [coord for bounds in all_bounds for coord in bounds]
+            min_x, min_y, max_x, max_y = merged[0], merged[1], merged[2], merged[3]
+            for bounds in all_bounds[1:]:
+                min_x = min(min_x, bounds[0])
+                min_y = min(min_y, bounds[1])
+                max_x = max(max_x, bounds[2])
+                max_y = max(max_y, bounds[3])
+
+            center_lon = (min_x + max_x) / 2
+            center_lat = (min_y + max_y) / 2
+
+            width_deg = max(max_x - min_x, 0.0001)
+            height_deg = max(max_y - min_y, 0.0001)
+            scale = max(width_deg, height_deg)
+            zoom = max(8, min(17, 14 - math.log2(scale * 5)))
+
+    return center_lat, center_lon, zoom
+
+
+MAPBOX_STYLE = resolve_map_style(map_cfg.get("mapbox_style", "dark_no_labels"))
+MAPBOX_TOKEN = os.getenv("MAPBOX_API_KEY") or os.getenv("MAPBOX_ACCESS_TOKEN")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -132,24 +194,16 @@ left_pane, right_pane = st.columns([3, 1])
 
 with left_pane:
     layers = []
-    # Determine map center: spill centroid > culprit centroid > config defaults
-    center_lat, center_lon = DEFAULT_LAT, DEFAULT_LON
-    view_zoom = DEFAULT_ZOOM
-    # Render Spill GeoJSON (Red)
+    center_lat, center_lon, view_zoom = compute_event_view(spill_gdf, culprit_gdf)
+
     if has_spill and show_spill:
         with open(SPILL_PATH, "r") as f:
             spill_geojson_data = json.load(f)
-        # robust centroid extraction
-        try:
-            center_point = spill_gdf.unary_union.centroid
-            center_lat, center_lon = center_point.y, center_point.x
-        except Exception:
-            center_lat, center_lon = DEFAULT_LAT, DEFAULT_LON
 
         spill_layer = pdk.Layer(
             "GeoJsonLayer",
             spill_geojson_data,
-            opacity=0.7,
+            opacity=0.78,
             stroked=True,
             filled=True,
             get_fill_color=[230, 57, 70, 180],
@@ -159,23 +213,14 @@ with left_pane:
         )
         layers.append(spill_layer)
 
-    # Render Culprit Vessel Route (Cyan Line)
     if culprit_detected and culprit_gdf is not None and not culprit_gdf.empty and show_vessel:
         with open(CULPRIT_PATH, "r") as f:
             culprit_geojson_data = json.load(f)
 
-        # if no spill center chosen yet, use culprit centroid
-        if center_lat == DEFAULT_LAT and center_lon == DEFAULT_LON:
-            try:
-                cpt = culprit_gdf.unary_union.centroid
-                center_lat, center_lon = cpt.y, cpt.x
-            except Exception:
-                pass
-
         vessel_layer = pdk.Layer(
             "GeoJsonLayer",
             culprit_geojson_data,
-            opacity=0.9,
+            opacity=0.95,
             stroked=True,
             filled=False,
             get_line_color=[0, 245, 212, 255],
@@ -188,30 +233,37 @@ with left_pane:
         latitude=center_lat,
         longitude=center_lon,
         zoom=view_zoom,
-        pitch=30
+        pitch=45,
+        bearing=0,
+        transition_duration=1200,
     )
 
-    # Choose a map style; support either Mapbox style name or Carto style strings from config
-    map_style = MAPBOX_STYLE if isinstance(MAPBOX_STYLE, str) else "mapbox://styles/mapbox/dark-v11"
+    if MAPBOX_TOKEN and isinstance(MAPBOX_STYLE, str) and MAPBOX_STYLE.startswith("mapbox://"):
+        map_provider = "mapbox"
+        map_style = MAPBOX_STYLE
+    else:
+        map_provider = "carto"
+        map_style = MAPBOX_STYLE if isinstance(MAPBOX_STYLE, str) else "dark_no_labels"
 
     r = pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
+        map_provider=map_provider,
         map_style=map_style,
         tooltip={"text": "Vessel / Spill Geometry"}
     )
-    st.pydeck_chart(r)
+    st.pydeck_chart(r, width="stretch")
 
 with right_pane:
     st.subheader("🖼️ Selected SAR Scene")
     if selected_image_path and os.path.exists(selected_image_path):
-        st.image(selected_image_path, caption=os.path.basename(selected_image_path), use_container_width=True)
+        st.image(selected_image_path, caption=os.path.basename(selected_image_path), width="stretch")
 
     # Mask preview (if available and requested)
     latest_mask = os.path.join(OUTPUT_DIR, "latest_mask.png")
     if show_mask and os.path.exists(latest_mask):
         st.subheader("🧭 Detected Mask Preview")
-        st.image(latest_mask, caption="Segmentation mask (latest)", use_container_width=True)
+        st.image(latest_mask, caption="Segmentation mask (latest)", width="stretch")
 
     st.subheader("📋 Incident Dossier")
     if culprit_detected and culprit_gdf is not None and not culprit_gdf.empty:
