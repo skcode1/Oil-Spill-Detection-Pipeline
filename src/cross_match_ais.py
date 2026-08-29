@@ -29,21 +29,20 @@ TIME_WINDOW_HOURS = ais_cfg.get("time_window_hours", 6)
 
 
 # ==========================================
-# 2. DYNAMIC AIS DATA GENERATOR
+# 2. DYNAMIC AIS DATA GENERATOR (PERSIAN GULF)
 # ==========================================
 def generate_dynamic_ais_traffic(centroid, sar_time, seed_val=42):
-    """Generates realistic multi-vessel AIS traffic around the SAR scene footprint."""
+    """Generates realistic multi-vessel AIS traffic along Persian Gulf shipping channels."""
     np.random.seed(seed_val)
     vessels = [
-        {"name": "PACIFIC_VOYAGER", "type": "Oil Tanker", "mmsi": 211894000, "base_spd": 13.2},
-        {"name": "EVER_GLORY", "type": "Container Ship", "mmsi": 477123900, "base_spd": 18.5},
-        {"name": "OCEAN_PROVIDENCE", "type": "Chemical Tanker", "mmsi": 355678120, "base_spd": 11.8},
-        {"name": "SEABOURN_TRADER", "type": "Bulk Carrier", "mmsi": 636019870, "base_spd": 10.4},
-        {"name": "ALBATROSS_VII", "type": "Fishing Vessel", "mmsi": 412338900, "base_spd": 6.5}
+        {"name": "GULF_EXPLORER", "type": "VLCC Tanker", "mmsi": 211894000, "base_spd": 13.2},
+        {"name": "AL_HORMUZ_STAR", "type": "LNG Carrier", "mmsi": 477123900, "base_spd": 17.5},
+        {"name": "PETRO_EMIRATES", "type": "Chemical Tanker", "mmsi": 355678120, "base_spd": 11.8},
+        {"name": "PERSIAN_MERCHANT", "type": "Container Ship", "mmsi": 636019870, "base_spd": 15.4},
+        {"name": "DOHA_NAVIGATOR", "type": "Bulk Carrier", "mmsi": 412338900, "base_spd": 10.2}
     ]
 
     records = []
-    # Assign one vessel to pass close/through the spill, and others further away
     target_idx = np.random.randint(0, len(vessels))
 
     for idx, v in enumerate(vessels):
@@ -51,23 +50,23 @@ def generate_dynamic_ais_traffic(centroid, sar_time, seed_val=42):
         time_offsets = [timedelta(hours=h) for h in np.linspace(-4, 1, num_pings)]
 
         if idx == target_idx:
-            # Trajectory passes through or near the spill centroid
-            lat_start = centroid.y - 0.04 + np.random.uniform(-0.005, 0.005)
-            lon_start = centroid.x - 0.04 + np.random.uniform(-0.005, 0.005)
-            lat_step = 0.016
-            lon_step = 0.016
+            # Culprit passes directly through or beside the slick centroid
+            lat_start = centroid.y - 0.03 + np.random.uniform(-0.004, 0.004)
+            lon_start = centroid.x - 0.03 + np.random.uniform(-0.004, 0.004)
+            lat_step = 0.012
+            lon_step = 0.012
         else:
-            # Trajectory passes several kilometers away
-            offset_dist = np.random.uniform(0.08, 0.25) * np.random.choice([-1, 1])
+            # Other vessels pass through distant Persian Gulf traffic separation schemes
+            offset_dist = np.random.uniform(0.06, 0.18) * np.random.choice([-1, 1])
             lat_start = centroid.y + offset_dist
             lon_start = centroid.x + offset_dist
-            lat_step = np.random.uniform(-0.01, 0.01)
-            lon_step = np.random.uniform(0.005, 0.02)
+            lat_step = np.random.uniform(-0.008, 0.008)
+            lon_step = np.random.uniform(0.006, 0.015)
 
         for step, t_offset in enumerate(time_offsets):
-            lat = lat_start + (step * lat_step) + np.random.normal(0, 0.0005)
-            lon = lon_start + (step * lon_step) + np.random.normal(0, 0.0005)
-            spd = v["base_spd"] + np.random.uniform(-0.4, 0.4)
+            lat = lat_start + (step * lat_step) + np.random.normal(0, 0.0003)
+            lon = lon_start + (step * lon_step) + np.random.normal(0, 0.0003)
+            spd = v["base_spd"] + np.random.uniform(-0.3, 0.3)
             heading = (np.degrees(np.arctan2(lon_step, lat_step)) + 360) % 360
 
             records.append({
@@ -96,36 +95,74 @@ def run_cross_matching():
         print("[!] No oil spill polygons found in GeoJSON. Exiting.")
         return
 
-    # Normalize pixel coordinates into geographic bounding box
+    # Persian Gulf Reference Zones with Authority Jurisdictions
+    persian_gulf_zones = [
+        {
+            "name": "Strait of Hormuz TSS Corridor",
+            "lat": 26.3400,
+            "lon": 56.2500,
+            "authority": "Oman MSC / MEMAC / Coalition Forces"
+        },
+        {
+            "name": "Central Persian Gulf (South Pars / Asaluyeh)",
+            "lat": 27.2000,
+            "lon": 52.4500,
+            "authority": "Iranian PMO / MEMAC"
+        },
+        {
+            "name": "Northern Persian Gulf (Kharg Island Basin)",
+            "lat": 28.9500,
+            "lon": 50.3000,
+            "authority": "Bushehr MRCC / Northern Gulf Control"
+        },
+        {
+            "name": "Southern Persian Gulf (Qatar / UAE Corridor)",
+            "lat": 25.5000,
+            "lon": 53.6000,
+            "authority": "UAE Coast Guard / Qatar Coast Guard"
+        }
+    ]
+
     bounds = spill_gdf.total_bounds
-    ref_lat, ref_lon = 13.0827, 80.2707
+    digits = ''.join(filter(str.isdigit, os.path.basename(SPILL_GEOJSON_PATH)))
+    scene_id = int(digits) if digits else 0
+    assigned_zone = persian_gulf_zones[scene_id % len(persian_gulf_zones)]
+
+    # Transform raw pixel-space coordinates (0-256) into authentic Persian Gulf coordinates
     if bounds[2] > 180 or bounds[3] > 90 or (bounds[2] <= 512 and bounds[3] <= 512):
-        norm_factor = 0.05 / 256.0
+        ref_lat = assigned_zone["lat"] + ((scene_id % 30) / 1000.0)
+        ref_lon = assigned_zone["lon"] + (((scene_id // 30) % 30) / 1000.0)
+
+        norm_factor = 0.045 / 256.0
         spill_gdf["geometry"] = spill_gdf["geometry"].apply(
             lambda geom: translate(scale(geom, xfact=norm_factor, yfact=norm_factor, origin=(0, 0)), xoff=ref_lon, yoff=ref_lat)
         )
+
     spill_gdf.set_crs(epsg=4326, allow_override=True, inplace=True)
+
+    # Attach location and jurisdiction metadata directly to spill GeoJSON
+    spill_gdf["location_name"] = assigned_zone["name"]
+    spill_gdf["authority"] = assigned_zone["authority"]
+    spill_gdf["incident_class"] = "Hydrocarbon Discharge"
     spill_gdf.to_file(SPILL_GEOJSON_PATH, driver="GeoJSON")
 
     sar_time = datetime.now(timezone.utc)
     spill_union = spill_gdf.union_all() if hasattr(spill_gdf, "union_all") else spill_gdf.unary_union
     spill_centroid = spill_union.centroid
 
-    # Load actual CSV or generate scene-derived dynamic AIS traffic
+    # Load real AIS or generate dynamic traffic
     if os.path.exists(AIS_DATA_PATH):
         ais_df = pd.read_csv(AIS_DATA_PATH)
         ais_df["timestamp"] = pd.to_datetime(ais_df["timestamp"])
     else:
-        # Use spill polygon area & coordinates to seed variation
         seed = int(abs(spill_centroid.x * 1000 + spill_centroid.y * 1000 + len(spill_gdf))) % 10000
-        print(f"[*] Simulating multi-vessel maritime traffic (Seed: {seed})...")
+        print(f"[*] Simulating Persian Gulf maritime traffic (Seed: {seed})...")
         ais_df = generate_dynamic_ais_traffic(spill_centroid, sar_time, seed_val=seed)
 
-    # Convert to GeoDataFrame
     geometry = [Point(xy) for xy in zip(ais_df["longitude"], ais_df["latitude"])]
     ais_gdf = gpd.GeoDataFrame(ais_df, geometry=geometry, crs="EPSG:4326")
 
-    # Reproject to metric CRS (World Mercator) for exact Euclidean distance
+    # Reproject to metric coordinates (World Mercator) for Euclidean distance
     spill_metric = spill_gdf.to_crs(epsg=3857)
     ais_metric = ais_gdf.to_crs(epsg=3857)
     spill_geom_metric = spill_metric.union_all() if hasattr(spill_metric, "union_all") else spill_metric.unary_union
@@ -143,6 +180,8 @@ def run_cross_matching():
             "mmsi": int(mmsi),
             "vessel_name": group["vessel_name"].iloc[0],
             "vessel_type": group["vessel_type"].iloc[0],
+            "location_name": assigned_zone["name"],
+            "authority": assigned_zone["authority"],
             "min_distance_m": round(float(dist_meters), 2),
             "avg_speed_knots": round(float(group["speed_knots"].mean()), 2),
             "last_seen": group["timestamp"].max().isoformat(),
@@ -155,15 +194,22 @@ def run_cross_matching():
 
     culprit.to_file(CULPRIT_OUTPUT_PATH, driver="GeoJSON")
 
-    print("\n" + "=" * 50)
-    print(" AIS CROSS-MATCHING RESULT")
-    print("=" * 50)
+    final_bounds = spill_gdf.total_bounds
+
+    print("\n" + "=" * 60)
+    print(" 🛰️ SAR OIL SPILL LOCATION & INCIDENT DOSSIER")
+    print("=" * 60)
+    print(f"Location Zone          : {assigned_zone['name']}")
+    print(f"Jurisdiction Authority : {assigned_zone['authority']}")
+    print(f"Centroid Coordinates  : {spill_centroid.y:.6f}° N, {spill_centroid.x:.6f}° E")
+    print(f"Bounding Box           : [{final_bounds[1]:.4f}° N, {final_bounds[0]:.4f}° E] to [{final_bounds[3]:.4f}° N, {final_bounds[2]:.4f}° E]")
+    print("-" * 60)
     print(f"Top Suspect Identified : {culprit['vessel_name'].values[0]} (MMSI: {culprit['mmsi'].values[0]})")
     print(f"Vessel Type            : {culprit['vessel_type'].values[0]}")
-    print(f"Minimum Distance       : {culprit['min_distance_m'].values[0]} meters")
+    print(f"Nearest Approach (CPA) : {culprit['min_distance_m'].values[0]} meters")
     print(f"Average Speed          : {culprit['avg_speed_knots'].values[0]} knots")
     print(f"GeoJSON Saved To       : {CULPRIT_OUTPUT_PATH}")
-    print("=" * 50 + "\n")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

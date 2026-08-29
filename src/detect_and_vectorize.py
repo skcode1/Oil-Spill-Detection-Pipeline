@@ -97,6 +97,10 @@ def mask_to_polygons(
 ) -> gpd.GeoDataFrame:
     """
     Extracts geometric boundaries from the binary mask and returns a GeoDataFrame.
+
+    For real GeoTIFF inputs (.tif/.tiff), the raster affine transform matrix is used to
+    convert image pixel coordinates directly to geographic coordinates (lon/lat). This keeps
+    the output georeferenced without requiring any manual fallback anchor.
     """
     transform, crs = geo_meta
     polygons = []
@@ -119,9 +123,13 @@ def mask_to_polygons(
         if len(coords.shape) != 2 or coords.shape[0] < 3:
             continue
 
-        # Convert to geospatial coordinates if transform exists
-        if transform is not None:
-            geo_coords = [transform * (pt[0], pt[1]) for pt in coords]
+        # Real GeoTIFF imagery: use raster affine metadata to convert pixel coordinates
+        # directly into geographic coordinates. This is the authoritative geospatial path.
+        if transform is not None and crs is not None:
+            geo_coords = [
+                (float(x), float(y))
+                for x, y in [transform * (float(pt[0]), float(pt[1])) for pt in coords]
+            ]
             poly = Polygon(geo_coords)
         else:
             poly = Polygon(coords)

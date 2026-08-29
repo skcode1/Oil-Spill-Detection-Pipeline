@@ -1,14 +1,14 @@
 import os
 import glob
 import json
-import math
 import yaml
 import subprocess
 import shutil
+import cv2
+import numpy as np
 import streamlit as st
 import geopandas as gpd
 import pydeck as pdk
-from PIL import Image
 
 st.set_page_config(
     page_title="Maritime Oil Spill & AIS Surveillance",
@@ -29,178 +29,266 @@ OUTPUT_DIR = paths_cfg.get("output_dir", "results")
 MODEL_PATH = paths_cfg.get("model_checkpoint", "models/sar_unet_best.pth")
 SPILL_PATH = os.path.join(OUTPUT_DIR, "spill_polygon.geojson")
 CULPRIT_PATH = os.path.join(OUTPUT_DIR, "culprit_vessel.geojson")
-
-# Map defaults from config
-map_cfg = config.get("map_dashboard", {}) or {}
-DEFAULT_LAT = map_cfg.get("center_lat", 13.0827)
-DEFAULT_LON = map_cfg.get("center_lon", 80.2707)
-DEFAULT_ZOOM = map_cfg.get("initial_zoom", 9)
-
-
-def resolve_map_style(style_name):
-    if not style_name:
-        return "dark_no_labels"
-    style_name = str(style_name).strip()
-    if style_name.startswith("mapbox://"):
-        return style_name
-    valid_aliases = {
-        "carto-positron": "light_no_labels",
-        "carto_positron": "light_no_labels",
-        "carto-darkmatter": "dark_no_labels",
-        "carto_darkmatter": "dark_no_labels",
-        "dark": "dark_no_labels",
-        "light": "light_no_labels",
-        "light_no_labels": "light_no_labels",
-        "dark_no_labels": "dark_no_labels",
-        "satellite": "mapbox://styles/mapbox/satellite-streets-v12",
-        "satellite-streets": "mapbox://styles/mapbox/satellite-streets-v12",
-    }
-    return valid_aliases.get(style_name.lower(), "dark_no_labels")
-
-
-def compute_event_view(spill_gdf=None, culprit_gdf=None):
-    center_lat, center_lon = DEFAULT_LAT, DEFAULT_LON
-    zoom = DEFAULT_ZOOM
-
-    candidates = []
-    if spill_gdf is not None and not spill_gdf.empty:
-        candidates.append(spill_gdf)
-    if culprit_gdf is not None and not culprit_gdf.empty:
-        candidates.append(culprit_gdf)
-
-    if candidates:
-        all_bounds = []
-        for gdf in candidates:
-            try:
-                all_bounds.append(gdf.total_bounds)
-            except Exception:
-                pass
-        if all_bounds:
-            merged = [coord for bounds in all_bounds for coord in bounds]
-            min_x, min_y, max_x, max_y = merged[0], merged[1], merged[2], merged[3]
-            for bounds in all_bounds[1:]:
-                min_x = min(min_x, bounds[0])
-                min_y = min(min_y, bounds[1])
-                max_x = max(max_x, bounds[2])
-                max_y = max(max_y, bounds[3])
-
-            center_lon = (min_x + max_x) / 2
-            center_lat = (min_y + max_y) / 2
-
-            width_deg = max(max_x - min_x, 0.0001)
-            height_deg = max(max_y - min_y, 0.0001)
-            scale = max(width_deg, height_deg)
-            zoom = max(8, min(17, 14 - math.log2(scale * 5)))
-
-    return center_lat, center_lon, zoom
-
-
-MAPBOX_STYLE = resolve_map_style(map_cfg.get("mapbox_style", "dark_no_labels"))
-MAPBOX_TOKEN = os.getenv("MAPBOX_API_KEY") or os.getenv("MAPBOX_ACCESS_TOKEN")
+LATEST_MASK_PATH = os.path.join(OUTPUT_DIR, "latest_mask.png")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 2. Sidebar: Automated Pipeline Controller
+
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        .main > div {
+            padding-top: 1rem;
+        }
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.2rem;
+            font-weight: 700;
+        }
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetricContainer"]) {
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 0.8rem;
+            padding: 0.5rem 0.75rem;
+        }
+        .status-chip {
+            display: inline-block;
+            padding: 0.35rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            background: rgba(22, 163, 74, 0.12);
+            color: #7ef0b6;
+            border: 1px solid rgba(110, 231, 183, 0.35);
+        }
+        .warning-chip {
+            display: inline-block;
+            padding: 0.35rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            background: rgba(245, 158, 11, 0.12);
+            color: #fbd38d;
+            border: 1px solid rgba(251, 191, 36, 0.35);
+        }
+        .danger-chip {
+            display: inline-block;
+            padding: 0.35rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            background: rgba(239, 68, 68, 0.12);
+            color: #fca5a5;
+            border: 1px solid rgba(252, 165, 165, 0.4);
+        }
+        .info-panel {
+            background: linear-gradient(135deg, rgba(17,24,39,0.88), rgba(15,23,42,0.72));
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 1rem;
+            padding: 1rem 1.1rem;
+            margin: 0.6rem 0 1rem 0;
+        }
+        .subtle-label {
+            color: #9ca3af;
+            font-size: 0.8rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def validate_sar_image(image_path):
+    """Validates radiometric characteristics to reject regular optical/camera photos."""
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return False, "Unreadable image file format."
+
+    if len(img.shape) == 3 and img.shape[2] >= 3:
+        b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+        diff_rg = np.mean(np.abs(r.astype(float) - g.astype(float)))
+        diff_gb = np.mean(np.abs(g.astype(float) - b.astype(float)))
+        if diff_rg > 8.0 or diff_gb > 8.0:
+            return False, "Optical/RGB photo detected. Model requires Sentinel-1 SAR backscatter imagery."
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    if np.std(gray) < 5.0:
+        return False, "Insufficient dynamic range or blank image."
+
+    return True, "Valid SAR backscatter scene."
+
+
+# 2. Sidebar Controls
 st.sidebar.title("🛠️ Control Panel")
 st.sidebar.markdown("Automate SAR segmentation and AIS correlation across scenes.")
 
-# Layer visibility toggles
-st.sidebar.markdown("---")
 show_spill = st.sidebar.checkbox("Show Spill Layer", value=True)
 show_vessel = st.sidebar.checkbox("Show Vessel Route", value=True)
-show_mask = st.sidebar.checkbox("Show Mask Overlay (if available)", value=False)
-
-available_images = sorted(glob.glob(os.path.join(RAW_SAR_DIR, "*.*")))
-image_names = [os.path.basename(p) for p in available_images]
+show_mask = st.sidebar.checkbox("Show Mask Overlay", value=False)
 
 input_mode = st.sidebar.radio("Input Source", ["Select from Dataset", "Upload Custom SAR Scene"])
 selected_image_path = None
 
 if input_mode == "Select from Dataset":
+    available_images = sorted(glob.glob(os.path.join(RAW_SAR_DIR, "*.*")))
+    image_names = [os.path.basename(p) for p in available_images]
     if image_names:
         selected_name = st.sidebar.selectbox("Choose SAR Scene", image_names)
         selected_image_path = os.path.join(RAW_SAR_DIR, selected_name)
+        st.session_state["active_image"] = selected_image_path
     else:
         st.sidebar.warning("No images found in raw dataset directory.")
 else:
-    uploaded_file = st.sidebar.file_uploader("Upload SAR image (.png, .jpg, .tif)", type=["png", "jpg", "jpeg", "tif", "tiff"])
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload SAR Image", 
+        type=["png", "jpg", "jpeg", "tif", "tiff", "PNG", "JPG", "JPEG", "TIF", "TIFF"],
+        key="sar_uploader"
+    )
     if uploaded_file is not None:
-        temp_path = os.path.join(OUTPUT_DIR, "temp_uploaded_scene.png")
-        with open(temp_path, "wb") as f:
+        save_dest = os.path.join(OUTPUT_DIR, f"uploaded_{uploaded_file.name}")
+        with open(save_dest, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        selected_image_path = temp_path
+        st.session_state["active_image"] = save_dest
+        selected_image_path = save_dest
+
+if "active_image" in st.session_state and os.path.exists(st.session_state["active_image"]):
+    selected_image_path = st.session_state["active_image"]
 
 conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
 
-# Trigger Automated End-to-End Execution
+# 3. Execution Trigger
 if st.sidebar.button("🚀 Run Full Pipeline", type="primary"):
     if selected_image_path and os.path.exists(selected_image_path):
-        with st.spinner("Executing U-Net inference, vectorization, and AIS cross-matching..."):
-            # Step A: Run detection & vectorization
-            cmd_detect = [
-                "python3", "src/detect_and_vectorize.py",
-                "--input", selected_image_path,
-                "--model", MODEL_PATH,
-                "--output_dir", OUTPUT_DIR,
-                "--threshold", str(conf_threshold),
-                "--save_mask"
-            ]
-            subprocess.run(cmd_detect, check=True)
+        # Step 0: Validate SAR Data Authenticity
+        is_valid_sar, message = validate_sar_image(selected_image_path)
+        
+        if not is_valid_sar:
+            # Purge any stale outputs
+            for old_file in [SPILL_PATH, CULPRIT_PATH, LATEST_MASK_PATH]:
+                if os.path.exists(old_file):
+                    os.remove(old_file)
+            st.sidebar.error(f"❌ Input Rejected: {message}")
+        else:
+            with st.spinner("Processing valid SAR scene and correlating AIS tracks..."):
+                for old_file in [SPILL_PATH, CULPRIT_PATH, LATEST_MASK_PATH]:
+                    if os.path.exists(old_file):
+                        os.remove(old_file)
 
-            # Step B: Standardize output filename to spill_polygon.geojson
-            base_id = os.path.splitext(os.path.basename(selected_image_path))[0]
-            detected_geo = os.path.join(OUTPUT_DIR, f"{base_id}_detected.geojson")
-            if os.path.exists(detected_geo):
-                shutil.copy(detected_geo, SPILL_PATH)
+                # Step A: Run Model Detection
+                cmd_detect = [
+                    "python3", "src/detect_and_vectorize.py",
+                    "--input", selected_image_path,
+                    "--model", MODEL_PATH,
+                    "--output_dir", OUTPUT_DIR,
+                    "--threshold", str(conf_threshold),
+                    "--save_mask"
+                ]
+                subprocess.run(cmd_detect, check=True)
 
-            # also copy mask image if produced (convention: <base>_mask.png)
-            detected_mask = os.path.join(OUTPUT_DIR, f"{base_id}_mask.png")
-            if os.path.exists(detected_mask):
-                shutil.copy(detected_mask, os.path.join(OUTPUT_DIR, "latest_mask.png"))
+                # Step B: Copy Output Files
+                base_id = os.path.splitext(os.path.basename(selected_image_path))[0]
+                detected_geo = os.path.join(OUTPUT_DIR, f"{base_id}_detected.geojson")
+                if os.path.exists(detected_geo):
+                    shutil.copy(detected_geo, SPILL_PATH)
 
-            # Step C: Run AIS Cross-Matching
-            subprocess.run(["python3", "src/cross_match_ais.py"], check=True)
-            st.sidebar.success("Analysis complete!")
+                detected_mask = os.path.join(OUTPUT_DIR, f"{base_id}_mask.png")
+                if os.path.exists(detected_mask):
+                    shutil.copy(detected_mask, LATEST_MASK_PATH)
+
+                # Step C: AIS Cross Matching
+                if os.path.exists(SPILL_PATH) and os.path.getsize(SPILL_PATH) > 0:
+                    subprocess.run(["python3", "src/cross_match_ais.py"], check=True)
+                    st.sidebar.success("Analysis complete.")
+                else:
+                    st.sidebar.info("No slicks detected in SAR scene.")
+                st.rerun()
     else:
-        st.sidebar.error("Please select or upload a valid SAR image.")
+        st.sidebar.error("Please upload or select an image file first.")
 
-# 3. Main Dashboard Header & Metrics
-st.title("🛰️ Sentinel-1 SAR Oil Spill & AIS Culprit Tracking")
+# 4. Status Metrics
+inject_custom_css()
 
-spill_detected = os.path.exists(SPILL_PATH)
-culprit_detected = os.path.exists(CULPRIT_PATH)
+st.markdown(
+    """
+    <div class="info-panel">
+        <div class="subtle-label">Maritime Intelligence Dashboard</div>
+        <h2 style="margin: 0.2rem 0 0.4rem 0;">🛰️ Sentinel-1 SAR Oil Spill & AIS Culprit Tracking</h2>
+        <div style="color:#cbd5e1; font-size:0.95rem;">
+            Monitoring spill signatures and correlating vessel activity for high-risk maritime incidents.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+spill_detected = os.path.exists(SPILL_PATH) and os.path.getsize(SPILL_PATH) > 0
+culprit_detected = os.path.exists(CULPRIT_PATH) and os.path.getsize(CULPRIT_PATH) > 0
 
 spill_gdf = gpd.read_file(SPILL_PATH) if spill_detected else None
 culprit_gdf = gpd.read_file(CULPRIT_PATH) if culprit_detected else None
 
+has_spill = spill_gdf is not None and not spill_gdf.empty
+scene_valid = True
+scene_message = "Ready"
+if selected_image_path and os.path.exists(selected_image_path):
+    scene_valid, scene_message = validate_sar_image(selected_image_path)
+
+status_chip = "<span class='status-chip'>HEALTHY</span>" if scene_valid else "<span class='danger-chip'>INVALID INPUT</span>"
+if not selected_image_path or not os.path.exists(selected_image_path):
+    status_chip = "<span class='warning-chip'>WAITING FOR IMAGE</span>"
+
+st.markdown(
+    f"""
+    <div class="info-panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap;">
+            <div>
+                <div class="subtle-label">Scene Validation</div>
+                <div style="font-size:1.05rem; color:#e2e8f0; margin-top:0.25rem;">{scene_message}</div>
+            </div>
+            <div>{status_chip}</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    has_spill = spill_detected and spill_gdf is not None and not spill_gdf.empty
-    st.metric("Spill Status", "CONFIRMED" if has_spill else "CLEAR")
+    st.metric("Spill Status", "CONFIRMED" if has_spill else "CLEAR / INVALID")
 with col2:
-    slick_count = len(spill_gdf) if has_spill else 0
-    st.metric("Detected Slick Polygons", f"{slick_count}")
+    st.metric("Detected Slick Polygons", f"{len(spill_gdf)}" if has_spill else "0")
 with col3:
-    vessel_name = culprit_gdf["vessel_name"].iloc[0] if (culprit_detected and culprit_gdf is not None and not culprit_gdf.empty) else "N/A"
+    vessel_name = culprit_gdf["vessel_name"].iloc[0] if (culprit_gdf is not None and not culprit_gdf.empty) else "None"
     st.metric("Top Suspect Vessel", vessel_name)
 with col4:
-    min_dist = culprit_gdf["min_distance_m"].iloc[0] if (culprit_detected and culprit_gdf is not None and not culprit_gdf.empty) else "N/A"
+    min_dist = culprit_gdf["min_distance_m"].iloc[0] if (culprit_gdf is not None and not culprit_gdf.empty) else "N/A"
     st.metric("Trajectory Proximity", f"{min_dist} m" if min_dist != "N/A" else "N/A")
 
 st.divider()
 
-# 4. Map & Dossier Visualization
+# 5. Map & Incident Display
 left_pane, right_pane = st.columns([3, 1])
 
 with left_pane:
     layers = []
-    center_lat, center_lon, view_zoom = compute_event_view(spill_gdf, culprit_gdf)
+    center_lat, center_lon = 13.0827, 80.2707
 
     if has_spill and show_spill:
         with open(SPILL_PATH, "r") as f:
             spill_geojson_data = json.load(f)
+        center_point = spill_gdf.union_all().centroid if hasattr(spill_gdf, "union_all") else spill_gdf.unary_union.centroid
+        center_lat, center_lon = center_point.y, center_point.x
 
-        spill_layer = pdk.Layer(
+        layers.append(pdk.Layer(
             "GeoJsonLayer",
             spill_geojson_data,
             opacity=0.78,
@@ -210,14 +298,13 @@ with left_pane:
             get_line_color=[255, 255, 255, 255],
             get_line_width=2,
             pickable=True
-        )
-        layers.append(spill_layer)
+        ))
 
-    if culprit_detected and culprit_gdf is not None and not culprit_gdf.empty and show_vessel:
+    if culprit_gdf is not None and not culprit_gdf.empty and show_vessel:
         with open(CULPRIT_PATH, "r") as f:
             culprit_geojson_data = json.load(f)
 
-        vessel_layer = pdk.Layer(
+        layers.append(pdk.Layer(
             "GeoJsonLayer",
             culprit_geojson_data,
             opacity=0.95,
@@ -226,87 +313,71 @@ with left_pane:
             get_line_color=[0, 245, 212, 255],
             get_line_width=4,
             pickable=True
-        )
-        layers.append(vessel_layer)
+        ))
+
+    if not has_spill and (culprit_gdf is None or culprit_gdf.empty):
+        st.info("Select or upload a SAR image and run the pipeline to populate the map.")
 
     view_state = pdk.ViewState(
         latitude=center_lat,
         longitude=center_lon,
-        zoom=view_zoom,
-        pitch=45,
+        zoom=10,
+        pitch=30,
         bearing=0,
-        transition_duration=1200,
+        transition_duration=800,
     )
 
-    if MAPBOX_TOKEN and isinstance(MAPBOX_STYLE, str) and MAPBOX_STYLE.startswith("mapbox://"):
-        map_provider = "mapbox"
-        map_style = MAPBOX_STYLE
-    else:
-        map_provider = "carto"
-        map_style = MAPBOX_STYLE if isinstance(MAPBOX_STYLE, str) else "dark_no_labels"
-
+    # Keep map visible without requiring a Mapbox token.
     r = pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
-        map_provider=map_provider,
-        map_style=map_style,
+        map_provider="carto",
+        map_style="dark_no_labels",
         tooltip={"text": "Vessel / Spill Geometry"}
     )
     st.pydeck_chart(r, width="stretch")
 
 with right_pane:
-    st.subheader("🖼️ Selected SAR Scene")
+    st.subheader("🖼️ Target Scene")
     if selected_image_path and os.path.exists(selected_image_path):
         st.image(selected_image_path, caption=os.path.basename(selected_image_path), width="stretch")
 
-    # Mask preview (if available and requested)
-    latest_mask = os.path.join(OUTPUT_DIR, "latest_mask.png")
-    if show_mask and os.path.exists(latest_mask):
-        st.subheader("🧭 Detected Mask Preview")
-        st.image(latest_mask, caption="Segmentation mask (latest)", width="stretch")
+    if show_mask and os.path.exists(LATEST_MASK_PATH):
+        st.subheader("🧭 Model Binary Mask")
+        st.image(LATEST_MASK_PATH, caption="Output Mask", width="stretch")
 
-    st.subheader("📋 Incident Dossier")
-    if culprit_detected and culprit_gdf is not None and not culprit_gdf.empty:
-        culprit_info = culprit_gdf.iloc[0]
-        st.write(f"**Vessel Name:** {culprit_info.get('vessel_name', 'Unknown')}")
-        st.write(f"**MMSI:** `{culprit_info.get('mmsi', 'Unknown')}`")
-        st.write(f"**Vessel Type:** {culprit_info.get('vessel_type', 'Unknown')}")
-        st.write(f"**Avg Speed:** {culprit_info.get('avg_speed_knots', 'N/A')} knots")
-        st.write(f"**Nearest Approach:** {culprit_info.get('min_distance_m', 'N/A')} m")
-        st.write(f"**Last Ping (UTC):** {culprit_info.get('last_seen', 'N/A')}")
+    st.subheader("� Spill Geo-Location")
+    if has_spill and spill_gdf is not None:
+        spill_union = spill_gdf.union_all() if hasattr(spill_gdf, "union_all") else spill_gdf.unary_union
+        spill_centroid = spill_union.centroid
+        min_lon, min_lat, max_lon, max_lat = spill_gdf.total_bounds
+
+        area_km2 = (spill_gdf.to_crs(epsg=3857).area.sum()) / 1e6
+
+        st.markdown(f"**Centroid Lat/Lon:** `{spill_centroid.y:.5f}° N, {spill_centroid.x:.5f}° E`")
+        st.markdown("**Bounding Box:**")
+        st.caption(f"SW: `{min_lat:.4f}°, {min_lon:.4f}°` | NE: `{max_lat:.4f}°, {max_lon:.4f}°`")
+        st.markdown(f"**Estimated Slick Area:** `{area_km2:.3f} km²`")
     else:
-        st.info("No culprit vessel data available.")
+        st.info("No active spill location coordinates.")
 
-    st.subheader("⚙️ Active Legend")
-    st.markdown("🔴 **Red Polygon**: Oil Spill Segmentation")
-    st.markdown("🟢/🔵 **Cyan Line**: Vessel Trajectory")
+    st.divider()
 
-    # Download buttons
+    st.subheader("�📋 Incident Dossier")
+    if culprit_gdf is not None and not culprit_gdf.empty:
+        info = culprit_gdf.iloc[0]
+        st.write(f"**Vessel Name:** {info.get('vessel_name', 'Unknown')}")
+        st.write(f"**MMSI:** `{info.get('mmsi', 'Unknown')}`")
+        st.write(f"**Vessel Type:** {info.get('vessel_type', 'Unknown')}")
+        st.write(f"**Avg Speed:** {info.get('avg_speed_knots', 'N/A')} knots")
+        st.write(f"**Nearest Approach:** {info.get('min_distance_m', 'N/A')} m")
+        st.write(f"**Last Ping (UTC):** {info.get('last_seen', 'N/A')}")
+    else:
+        st.info("No active incident details.")
+
     st.markdown("---")
+    st.caption("Operational notes")
     if has_spill:
-        try:
-            with open(SPILL_PATH, "r") as f:
-                geojson_text = f.read()
-            st.download_button("Download Spill GeoJSON", data=geojson_text, file_name="spill_polygon.geojson")
-        except Exception:
-            pass
-
-    if culprit_detected:
-        try:
-            with open(CULPRIT_PATH, "r") as f:
-                geojson_text = f.read()
-            st.download_button("Download Culprit GeoJSON", data=geojson_text, file_name="culprit_vessel.geojson")
-        except Exception:
-            pass
-
-    # Basic spill stats (area) if CRS supports metric reprojection
-    if has_spill:
-        try:
-            metric_crs = config.get('ais', {}).get('metric_crs', 'EPSG:3857')
-            areas = (spill_gdf.to_crs(metric_crs).area / 1.0).round(1)
-            stats_df = spill_gdf.copy()
-            stats_df['area_m2'] = areas
-            st.subheader('📊 Detection Summary')
-            st.dataframe(stats_df[[col for col in stats_df.columns if col != 'geometry']].fillna(''))
-        except Exception:
-            pass
+        st.success("Spill polygon detected and mapped to the incident area.")
+    else:
+        st.warning("No confirmed spill polygon for the current SAR scene.")
