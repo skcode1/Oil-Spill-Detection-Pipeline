@@ -1,0 +1,39 @@
+paths:
+  # Input datasets & checkpoints
+  raw_sar_dir: "data/raw/SAR_training/sentinel"
+  test_sar_scene: "data/raw/SAR_training/sentinel/image"
+  ais_csv: "data/raw/ais_data.csv"
+  model_checkpoint: "models/sar_unet_best.pth"
+
+  # Custom Separate Output Artifacts Folder
+  output_dir: "results"
+  spill_geojson: "results/spill_polygon.geojson"
+  culprit_geojson: "results/culprit_vessel.geojson"
+
+model:
+  architecture: "unet"
+  encoder: "resnet34"
+  encoder_weights: null
+  in_channels: 1
+  classes: 1
+  input_size: [256, 256]
+  confidence_threshold: 0.50
+
+inference:
+  batch_size: 16
+  stride: 128
+  tile_size: 256
+  min_spill_area_pixels: 50
+  crs: "EPSG:4326"
+
+ais:
+  time_window_hours: 6
+  buffer_distance_m: 5000
+  metric_crs: "EPSG:3857"
+  geographic_crs: "EPSG:4326"
+
+map_dashboard:
+  mapbox_style: "carto-positron"
+  center_lat: 13.0827
+  center_lon: 80.2707
+  initial_zoom: 9

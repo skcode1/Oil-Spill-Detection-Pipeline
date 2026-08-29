@@ -1,0 +1,16 @@
+torch
+torchvision
+segmentation-models-pytorch
+rasterio
+shapely
+geopandas
+pandas
+numpy
+matplotlib
+streamlit
+pydeck
+pillow
+opencv-python-headless
+geopandas
+shapely
+rasterio
