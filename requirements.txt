@@ -14,3 +14,10 @@ opencv-python-headless
 geopandas
 shapely
 rasterio
+fastapi
+uvicorn
+opencv-python-headless
+geopandas
+rasterio
+shapely
+python-multipart

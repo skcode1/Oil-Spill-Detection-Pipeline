@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import shutil
@@ -174,7 +175,8 @@ async def run_pipeline(
             os.remove(old)
 
     cmd_detect = [
-        "python3", "src/detect_and_vectorize.py",
+         sys.executable, 
+         "src/detect_and_vectorize.py",
         "--input", target_path,
         "--model", MODEL_PATH,
         "--output_dir", OUTPUT_DIR,
