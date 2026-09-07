@@ -21,3 +21,4 @@ geopandas
 rasterio
 shapely
 python-multipart
+tifffile
