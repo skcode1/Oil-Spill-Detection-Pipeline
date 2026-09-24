@@ -69,7 +69,10 @@ def run_preprocessing():
     raw_dir = cfg.get("paths", {}).get("raw_sar_dir", "data/raw/SAR_training/sentinel")
     img_dir = os.path.join(raw_dir, "image")
     mask_dir = os.path.join(raw_dir, "label")
-    output_dir = "data/processed"
+    pre_cfg = cfg.get("preprocessing") or {}
+    output_dir = pre_cfg.get("output_dir", "data/processed")
+    tile_size = int(pre_cfg.get("tile_size", 256))
+    stride = int(pre_cfg.get("stride", 128))
 
     image_files = glob.glob(os.path.join(img_dir, "*.*"))
     if not image_files:
@@ -80,7 +83,7 @@ def run_preprocessing():
     for img_path in image_files:
         filename = os.path.basename(img_path)
         mask_path = os.path.join(mask_dir, filename) if os.path.exists(mask_dir) else None
-        preprocess_scene(img_path, mask_path, tile_size=256, stride=128, output_dir=output_dir)
+        preprocess_scene(img_path, mask_path, tile_size=tile_size, stride=stride, output_dir=output_dir)
 
     print(f"[Done] Preprocessing complete. Dataset saved in: {output_dir}")
 

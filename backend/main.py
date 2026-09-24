@@ -22,12 +22,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RAW_SAR_DIR = "data/raw/SAR_training/sentinel/image"
-OUTPUT_DIR = "results"
-MODEL_PATH = "models/sar_unet_best.pth"
+CONFIG_PATH = os.environ.get("PIPELINE_CONFIG", "config.yaml")
+
+
+def _load_config(path: str) -> dict:
+    """Loads the pipeline config; absence/malformation degrades to defaults."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            import yaml
+
+            return yaml.safe_load(handle) or {}
+    return {}
+
+
+config = _load_config(CONFIG_PATH)
+paths_cfg = config.get("paths") or {}
+backend_cfg = config.get("backend") or {}
+validation_cfg = config.get("validation") or {}
+map_cfg = config.get("map_dashboard") or {}
+_regions = config.get("regions") or []
+
+RAW_SAR_DIR = paths_cfg.get("test_sar_scene", "data/raw/SAR_training/sentinel/image")
+OUTPUT_DIR = paths_cfg.get("output_dir", "results")
+MODEL_PATH = paths_cfg.get("model_checkpoint", "models/sar_unet_best.pth")
 SPILL_PATH = os.path.join(OUTPUT_DIR, "spill_polygon.geojson")
 CULPRIT_PATH = os.path.join(OUTPUT_DIR, "culprit_vessel.geojson")
 LATEST_MASK_PATH = os.path.join(OUTPUT_DIR, "latest_mask.png")
+BASE_URL = str(backend_cfg.get("base_url", "http://localhost:8000")).rstrip("/")
+PYTHON_EXE = str(backend_cfg.get("python_executable") or sys.executable)
+DEFAULT_LOCATION_NAME = str(
+    backend_cfg.get("default_location_name")
+    or (_regions[0].get("name") if _regions else "Maritime Surveillance Zone")
+)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(RAW_SAR_DIR, exist_ok=True)
@@ -45,9 +71,14 @@ def is_supported_sar_extension(filename: str):
 
 
 def get_reference_sar_stats():
-    ref_dir = os.path.join("data", "raw", "SAR_training", "sentinel", "image")
+    ref_dir = RAW_SAR_DIR
+    fallback_stats = dict(validation_cfg.get("reference_stats") or {})
+    fallback_stats.setdefault("mean", 85.0)
+    fallback_stats.setdefault("std", 28.0)
+    fallback_stats.setdefault("min_dim", 64)
+    fallback_stats.setdefault("max_dim", 512)
     if not os.path.isdir(ref_dir):
-        return {"mean": 85.0, "std": 28.0, "min_dim": 64, "max_dim": 512}
+        return fallback_stats
 
     values = []
     for file in sorted(glob.glob(os.path.join(ref_dir, "*.*")))[:100]:
@@ -73,15 +104,15 @@ def get_reference_sar_stats():
         values.append({"mean": float(np.mean(gray)), "std": float(np.std(gray))})
 
     if not values:
-        return {"mean": 85.0, "std": 28.0, "min_dim": 64, "max_dim": 512}
+        return fallback_stats
 
     mean_vals = np.array([v["mean"] for v in values], dtype=float)
     std_vals = np.array([v["std"] for v in values], dtype=float)
     return {
         "mean": float(np.mean(mean_vals)),
         "std": float(np.mean(std_vals)),
-        "min_dim": 64,
-        "max_dim": 512,
+        "min_dim": int(fallback_stats["min_dim"]),
+        "max_dim": int(fallback_stats["max_dim"]),
         "mean_low": float(np.min(mean_vals)),
         "mean_high": float(np.max(mean_vals)),
         "std_low": float(np.min(std_vals)),
@@ -111,21 +142,28 @@ def validate_sar_image(image_path: str):
     else:
         return False, "Invalid SAR image: unsupported image structure. Only SAR scenes matching the dataset are accepted."
 
+    min_dim = int(validation_cfg.get("min_dim", fallback_stats["min_dim"]))
+    max_dim = int(validation_cfg.get("max_dim", fallback_stats["max_dim"]))
     h, w = gray.shape[:2]
-    if h < 32 or w < 32 or h > 512 or w > 512:
+    if h < min_dim or w < min_dim or h > max_dim or w > max_dim:
         return False, "Invalid SAR image: dimensions do not match valid SAR training data."
 
     ref = get_reference_sar_stats()
     gray_mean = float(np.mean(gray))
     gray_std = float(np.std(gray))
 
-    if gray_mean < 10.0 or gray_mean > 180.0:
+    mean_lo, mean_hi = (float(v) for v in validation_cfg.get("mean_range", (10.0, 180.0)))
+    std_lo, std_hi = (float(v) for v in validation_cfg.get("std_range", (5.0, 90.0)))
+    mean_tolerance = float(validation_cfg.get("mean_tolerance", 70.0))
+    std_tolerance = float(validation_cfg.get("std_tolerance", 45.0))
+
+    if gray_mean < mean_lo or gray_mean > mean_hi:
         return False, "Invalid SAR image: brightness profile does not match SAR training scenes."
-    if gray_std < 5.0 or gray_std > 90.0:
+    if gray_std < std_lo or gray_std > std_hi:
         return False, "Invalid SAR image: SAR texture signature is outside the valid dataset range."
-    if abs(gray_mean - ref["mean"]) > 70.0:
+    if abs(gray_mean - ref["mean"]) > mean_tolerance:
         return False, "Invalid SAR image: mean intensity does not match authentic SAR data."
-    if abs(gray_std - ref["std"]) > 45.0:
+    if abs(gray_std - ref["std"]) > std_tolerance:
         return False, "Invalid SAR image: SAR backscatter variance does not match the dataset."
 
     return True, "Valid SAR backscatter scene."
@@ -194,9 +232,11 @@ async def run_pipeline(
     if os.path.exists(detected_mask):
         shutil.copy(detected_mask, LATEST_MASK_PATH)
 
-    # 4. AIS Cross-Matching
+    # 4. AIS Cross-Matching (canonical dynamic engine, config-driven)
     if os.path.exists(SPILL_PATH) and os.path.getsize(SPILL_PATH) > 0:
-        subprocess.run(["python3", "src/cross_match_ais.py"], check=True)
+        subprocess.run(
+            [PYTHON_EXE, "src/cross_match_ais.py", "--config", CONFIG_PATH], check=True
+        )
 
     return get_current_status(target_path, msg)
 
@@ -224,7 +264,7 @@ def get_current_status(target_path=None, validation_msg="Valid SAR Scene"):
         area_km2 = float((spill_gdf.to_crs(epsg=3857).area.sum()) / 1e6)
 
         # Extract location name and authority from GeoJSON columns
-        location_name = spill_gdf["location_name"].iloc[0] if "location_name" in spill_gdf.columns else "Persian Gulf TSS"
+        location_name = spill_gdf["location_name"].iloc[0] if "location_name" in spill_gdf.columns else DEFAULT_LOCATION_NAME
         authority = spill_gdf["authority"].iloc[0] if "authority" in spill_gdf.columns else None
 
         geo_stats = {
@@ -258,6 +298,6 @@ def get_current_status(target_path=None, validation_msg="Valid SAR Scene"):
         "culprit_geojson": culprit_geojson,
         "geo_stats": geo_stats,
         "dossier": dossier,
-        "target_scene_url": f"http://localhost:8000/raw_sar/{os.path.basename(target_path)}" if (target_path and "raw_sar" in target_path) else (f"http://localhost:8000/results/{os.path.basename(target_path)}" if target_path else None),
-        "mask_url": "http://localhost:8000/results/latest_mask.png" if os.path.exists(LATEST_MASK_PATH) else None
+        "target_scene_url": f"{BASE_URL}/raw_sar/{os.path.basename(target_path)}" if (target_path and "raw_sar" in target_path) else (f"{BASE_URL}/results/{os.path.basename(target_path)}" if target_path else None),
+        "mask_url": f"{BASE_URL}/results/latest_mask.png" if os.path.exists(LATEST_MASK_PATH) else None
     }

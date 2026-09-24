@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+import sys
 import yaml
 import subprocess
 import shutil
@@ -24,6 +25,7 @@ if os.path.exists(CONFIG_PATH):
         config = yaml.safe_load(f) or {}
 
 paths_cfg = config.get("paths") or {}
+map_cfg = config.get("map_dashboard") or {}
 RAW_SAR_DIR = paths_cfg.get("test_sar_scene", "data/raw/SAR_training/sentinel/image")
 OUTPUT_DIR = paths_cfg.get("output_dir", "results")
 MODEL_PATH = paths_cfg.get("model_checkpoint", "models/sar_unet_best.pth")
@@ -204,9 +206,11 @@ if st.sidebar.button("🚀 Run Full Pipeline", type="primary"):
                 if os.path.exists(detected_mask):
                     shutil.copy(detected_mask, LATEST_MASK_PATH)
 
-                # Step C: AIS Cross Matching
+                # Step C: AIS Cross Matching (canonical dynamic engine)
                 if os.path.exists(SPILL_PATH) and os.path.getsize(SPILL_PATH) > 0:
-                    subprocess.run(["python3", "src/cross_match_ais.py"], check=True)
+                    subprocess.run(
+                        [sys.executable, "src/cross_match_ais.py", "--config", CONFIG_PATH], check=True
+                    )
                     st.sidebar.success("Analysis complete.")
                 else:
                     st.sidebar.info("No slicks detected in SAR scene.")
@@ -280,7 +284,8 @@ left_pane, right_pane = st.columns([3, 1])
 
 with left_pane:
     layers = []
-    center_lat, center_lon = 13.0827, 80.2707
+    center_lat = float(map_cfg.get("center_lat", 13.0827))
+    center_lon = float(map_cfg.get("center_lon", 80.2707))
 
     if has_spill and show_spill:
         with open(SPILL_PATH, "r") as f:
@@ -321,18 +326,18 @@ with left_pane:
     view_state = pdk.ViewState(
         latitude=center_lat,
         longitude=center_lon,
-        zoom=10,
-        pitch=30,
+        zoom=float(map_cfg.get("initial_zoom", 10)),
+        pitch=float(map_cfg.get("pitch", 30)),
         bearing=0,
         transition_duration=800,
     )
 
-    # Keep map visible without requiring a Mapbox token.
+    # Keep map visible without requiring a Mapbox token; style is config-driven.
     r = pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
         map_provider="carto",
-        map_style="dark_no_labels",
+        map_style=str(map_cfg.get("pydeck_style", "dark_no_labels")),
         tooltip={"text": "Vessel / Spill Geometry"}
     )
     st.pydeck_chart(r, width="stretch")

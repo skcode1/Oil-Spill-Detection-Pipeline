@@ -37,3 +37,123 @@ map_dashboard:
   center_lat: 25.9527
   center_lon: 53.3438
   initial_zoom: 8
+
+# End-to-end orchestrator defaults (src/run_pipeline.py). CLI flags override
+# these values; every former in-code literal now lives here.
+pipeline:
+  hindcast_hours: 24
+  time_step_minutes: 15
+  particles: 2000
+  oil_type: "GENERIC MEDIUM CRUDE"
+
+# Multi-factor culprit attribution profile (src/attribution_engine.py).
+# Weights are normalized to sum to 1 at runtime; sigma_r defaults to the
+# hindcast uncertainty semi-major axis when not set here.
+attribution:
+  weights:
+    proximity: 0.30
+    temporal: 0.20
+    trajectory: 0.10
+    kinematics: 0.15
+    ais_gaps: 0.10
+    vessel_type: 0.05
+  # SOG window (knots) at CPA treated as discharge-consistent behavior.
+  discharge_speed_band: [1.5, 6.0]
+  sigma_t_minutes: 60
+  gap_decay_minutes: 45
+  blackout_gap_minutes: 30
+  kinematic_radius_meters: 15000
+  deceleration_knots: 3.0
+
+# =============================================================
+# DYNAMIC REGION REGISTRY (src/region_registry.py)
+# -------------------------------------------------------------
+# Any user region can be added here without code changes; the
+# synthetic generator, metadata fallbacks and dashboards all
+# resolve their anchors from this registry.
+# =============================================================
+regions:
+  - {name: "Strait of Malacca", lat: 2.50, lon: 101.50, corridor_bearing: 310.0}
+  - {name: "Persian Gulf TSS", lat: 26.50, lon: 53.00, corridor_bearing: 290.0}
+  - {name: "Singapore Strait", lat: 1.25, lon: 103.90, corridor_bearing: 70.0}
+  - {name: "English Channel TSS", lat: 50.20, lon: -0.50, corridor_bearing: 65.0}
+  - {name: "Gulf of Guinea", lat: 4.50, lon: 6.00, corridor_bearing: 90.0}
+
+# OpenDrift physics + the config-driven analytical fallback field
+# (used only when no processed metocean manifest exists for an incident).
+metocean:
+  wind_drift_factor: 0.032
+  horizontal_diffusivity: 10.0
+  weathering_model: "adios"
+  release_seed_buffer_deg: 0.01
+  confidence_level: 0.95
+  fallback_hindcast_hours: 4.0
+  fallback_current_u_mps: 0.22
+  fallback_current_v_mps: 0.14
+  fallback_wind_u_mps: 5.20
+  fallback_wind_v_mps: 3.10
+  # Incident-specific dataset templates (src/environment_fetcher.py);
+  # {min_lat} {max_lat} {min_lon} {max_lon} {start} {end} placeholders,
+  # plus strftime forms such as {start:%Y-%m-%d}.
+  datasets:
+    copernicus_currents: "https://nrt.cmems-du.eu/thredds/dodsC/global-analysis-forecast-phy-001-024?uo[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
+    era5_wind: "https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis/surface/uwnd.sig995.nc?uwnd[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
+
+# Synthetic AIS/metocan scenario generator (src/simulation_generator.py):
+# produce MarineCadastre-style feeds for ANY region, time window and fleet.
+synthetic:
+  hindcast_hours: 4.0
+  random_seed: 42
+  background_vessels: 26
+  sensor_jitter_m: 10.0
+  sample_before_minutes: 60
+  sample_after_minutes: 60
+  sample_step_minutes: 5
+  pipeline_ais_output: "data/raw/ais_data.csv"
+  scenario:
+    culprit:
+      mmsi: 477901234
+      anomaly_halfwindow_minutes: 15
+      sog_discharge_knots: 8.5
+      sog_cruise_knots: 13.8
+      zigzag_amplitude_deg: 14.0
+      zigzag_period_minutes: 5.0
+      rot_amplitude: 12.0
+    parallel_distractor: {mmsi: 355672109, sog_knots: 18.2, lateral_offset_m: 12000, lane_offset_bearing_deg: 90.0}
+    dark_vessel: {mmsi: 636019888, sog_knots: 12.0, gap_start_minutes: -20, gap_end_minutes: 25}
+
+# SAR metadata fallbacks for non-georeferenced scenes (src/metadata_extractor.py).
+metadata:
+  fallback_region: "Persian Gulf TSS"
+  fallback_pad_deg: 0.02
+  default_patch_size: 512
+
+# SAR preprocessing / tiling (src/preprocess.py).
+preprocessing:
+  tile_size: 256
+  stride: 128
+  output_dir: "data/processed"
+
+# U-Net training profile (src/train.py).
+training:
+  epochs: 15
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  train_fraction: 0.85
+
+# SAR scene radiometric validation thresholds (backend/main.py).
+validation:
+  min_dim: 32
+  max_dim: 512
+  mean_range: [10.0, 180.0]
+  std_range: [5.0, 90.0]
+  mean_tolerance: 70.0
+  std_tolerance: 45.0
+  reference_stats: {mean: 85.0, std: 28.0}
+
+# FastAPI backend (backend/main.py).
+backend:
+  base_url: "http://localhost:8000"
+  python_executable: null    # defaults to sys.executable
+  default_location_name: null  # defaults to the first configured region name

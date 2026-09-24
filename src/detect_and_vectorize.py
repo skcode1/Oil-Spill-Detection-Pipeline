@@ -155,18 +155,37 @@ def mask_to_polygons(
 def main():
     parser = argparse.ArgumentParser(description="SAR Feature Detection & Vectorization Pipeline")
     parser.add_argument("--input", type=str, required=True, help="Path to input image file or directory")
-    parser.add_argument("--model", type=str, default=os.path.join(os.getcwd(), "models", "sar_unet_best.pth"), help="Trained weights path")
-    parser.add_argument("--output_dir", type=str, default=os.path.join(os.getcwd(), "outputs"), help="Directory for exported vectors and masks")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold (0.0 to 1.0)")
-    parser.add_argument("--min_area", type=int, default=30, help="Minimum pixel area threshold to filter speckle noise")
+    parser.add_argument("--model", type=str, default=None, help="Trained weights path (default: config paths.model_checkpoint)")
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory for exported vectors and masks (default: <cwd>/outputs)")
+    parser.add_argument("--threshold", type=float, default=None, help="Confidence threshold (default: config model.confidence_threshold)")
+    parser.add_argument("--min_area", type=int, default=None, help="Minimum pixel area threshold (default: config inference.min_spill_area_pixels)")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Configuration YAML providing defaults")
     parser.add_argument("--save_mask", action="store_true", help="Save predicted binary PNG alongside vector files")
     args = parser.parse_args()
 
+    config = {}
+    if os.path.exists(args.config):
+        import yaml
+
+        with open(args.config, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    paths_cfg = config.get("paths") or {}
+    model_cfg = config.get("model") or {}
+    inference_cfg = config.get("inference") or {}
+
+    model_path = args.model or paths_cfg.get(
+        "model_checkpoint", os.path.join(os.getcwd(), "models", "sar_unet_best.pth")
+    )
+    output_dir = args.output_dir or os.path.join(os.getcwd(), "outputs")
+    threshold = args.threshold if args.threshold is not None else float(model_cfg.get("confidence_threshold", 0.5))
+    min_area = args.min_area if args.min_area is not None else int(inference_cfg.get("min_spill_area_pixels", 30))
+    input_size = tuple(model_cfg.get("input_size", (256, 256)))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     print(f"[*] Loading model on {device}...")
-    model = load_trained_model(args.model, device)
+    model = load_trained_model(model_path, device)
 
     # Collect target files
     valid_exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -191,24 +210,25 @@ def main():
             model=model,
             image_path=img_path,
             device=device,
-            threshold=args.threshold
+            input_size=input_size,
+            threshold=threshold
         )
 
         # 2. Vectorization
-        gdf = mask_to_polygons(binary_mask, geo_meta=geo_meta, min_area_px=args.min_area)
+        gdf = mask_to_polygons(binary_mask, geo_meta=geo_meta, min_area_px=min_area)
 
         # 3. Export Vector (GeoJSON)
-        out_geojson = os.path.join(args.output_dir, f"{base_name}_detected.geojson")
+        out_geojson = os.path.join(output_dir, f"{base_name}_detected.geojson")
         gdf.to_file(out_geojson, driver="GeoJSON")
 
         # 4. Optional Mask Export
         if args.save_mask:
-            out_mask_path = os.path.join(args.output_dir, f"{base_name}_mask.png")
+            out_mask_path = os.path.join(output_dir, f"{base_name}_mask.png")
             cv2.imwrite(out_mask_path, binary_mask * 255)
 
         print(f"--> [Done] {base_name}: {len(gdf)} polygon(s) exported to {out_geojson}")
 
-    print(f"\nAll operations finished. Outputs saved to: {args.output_dir}")
+    print(f"\nAll operations finished. Outputs saved to: {output_dir}")
 
 
 if __name__ == "__main__":

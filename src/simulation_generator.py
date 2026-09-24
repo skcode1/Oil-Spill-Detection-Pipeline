@@ -2,26 +2,35 @@ import os
 import json
 import math
 import random
+import sys
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import yaml
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from shapely.geometry import Point, Polygon
 from shapely.affinity import scale, translate
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from src.region_registry import load_regions
+
 
 # ==========================================
-# 1. MARITIME HUBS & GEODETIC UTILITIES
+# 1. GEODETIC UTILITIES & CONFIG
 # ==========================================
-MAJOR_SHIPPING_CORRIDORS = [
-    {"name": "Strait of Malacca", "lat": 2.5000, "lon": 101.5000, "corridor_bearing": 310.0},
-    {"name": "Persian Gulf TSS", "lat": 26.5000, "lon": 53.0000, "corridor_bearing": 290.0},
-    {"name": "Singapore Strait", "lat": 1.2500, "lon": 103.9000, "corridor_bearing": 70.0},
-    {"name": "English Channel TSS", "lat": 50.2000, "lon": -0.5000, "corridor_bearing": 65.0},
-    {"name": "Gulf of Guinea", "lat": 4.5000, "lon": 6.0000, "corridor_bearing": 90.0},
-]
-
 KNOTS_TO_MPS = 0.514444
+
+
+def _load_config(path: str = "config.yaml") -> dict:
+    """Loads config.yaml; absence/malformation degrades to built-in defaults."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle) or {}
+    return {}
 
 
 def geodesic_step(lat: float, lon: float, distance_m: float, bearing_deg: float) -> tuple[float, float]:
@@ -58,15 +67,45 @@ def apply_sensor_jitter(lat: float, lon: float, sog: float, sigma_m: float = 8.0
 def generate_mock_environment(
     slick_geojson_path: str,
     output_dir: str = "data/processed",
-    hindcast_hours: float = 4.0,
+    hindcast_hours: Optional[float] = None,
     corridor_idx: int = 0,
-    random_seed: int = 42,
-    num_background_vessels: int = 26
+    random_seed: Optional[int] = None,
+    num_background_vessels: Optional[int] = None,
+    observation_time: Optional[datetime] = None,
+    config_path: str = "config.yaml",
+    pipeline_input_path: Optional[str] = None,
 ) -> dict:
     """
-    Constructs a synchronized MetOcean field and multi-vessel AIS traffic simulation
-    with 30 vessels, standard AIS telemetry, sensor jitter, and dynamic course turns.
+    Constructs a synchronized MetOcean field and multi-vessel AIS traffic
+    simulation for any region and temporal window.
+
+    Every formerly hard-coded generator constant (hindcast duration, seed,
+    fleet size, sensor jitter, sampling cadence, scenario-vessel kinematics,
+    metocean fallback field, pixel-space anchor region) is resolved from
+    ``config.yaml -> synthetic`` / ``metocean`` / ``regions`` with the
+    historical values as documented defaults; explicit arguments always win.
     """
+    cfg = _load_config(config_path)
+    synth_cfg = cfg.get("synthetic") or {}
+    metocean_cfg = cfg.get("metocean") or {}
+
+    hindcast_hours = float(
+        hindcast_hours if hindcast_hours is not None else synth_cfg.get("hindcast_hours", 4.0)
+    )
+    random_seed = int(random_seed if random_seed is not None else synth_cfg.get("random_seed", 42))
+    num_background_vessels = int(
+        num_background_vessels
+        if num_background_vessels is not None
+        else synth_cfg.get("background_vessels", 26)
+    )
+    jitter_sigma_m = float(synth_cfg.get("sensor_jitter_m", 10.0))
+    sample_before_min = int(synth_cfg.get("sample_before_minutes", 60))
+    sample_after_min = int(synth_cfg.get("sample_after_minutes", 60))
+    sample_step_min = int(synth_cfg.get("sample_step_minutes", 5))
+    scenario_cfg = dict(synth_cfg.get("scenario") or {})
+    if pipeline_input_path is None:
+        pipeline_input_path = synth_cfg.get("pipeline_ais_output", "data/raw/ais_data.csv")
+
     random.seed(random_seed)
     np.random.seed(random_seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -85,7 +124,8 @@ def generate_mock_environment(
     is_pixel_dimensions = (0.0 <= bounds[0] and bounds[2] <= 1024.0) and (0.0 <= bounds[1] and bounds[3] <= 1024.0) and has_no_crs
 
     is_pixel_space = has_no_crs or exceeds_wgs84 or is_pixel_dimensions
-    selected_corridor = MAJOR_SHIPPING_CORRIDORS[corridor_idx % len(MAJOR_SHIPPING_CORRIDORS)]
+    regions = load_regions(config_path)
+    selected_corridor = regions[corridor_idx % len(regions)]
 
     if is_pixel_space:
         print(f"[*] Detected pixel coordinates. Anchoring slick to corridor: {selected_corridor['name']}")
@@ -101,16 +141,16 @@ def generate_mock_environment(
 
     centroid = (slick_gdf.union_all() if hasattr(slick_gdf, "union_all") else slick_gdf.unary_union).centroid
     lat_sat, lon_sat = centroid.y, centroid.x
-    t_sat = datetime.now(timezone.utc)
+    t_sat = observation_time or datetime.now(timezone.utc)
 
-    # 2. Dynamic MetOcean Environment Field
+    # 2. Dynamic MetOcean Environment Field (config-driven fallback physics)
     metocean_profile = {
         "timestamp_sat": t_sat.isoformat(),
-        "u_current_mps": 0.22,
-        "v_current_mps": 0.14,
-        "u_wind_mps": 5.20,
-        "v_wind_mps": 3.10,
-        "wind_drift_factor": 0.032,
+        "u_current_mps": float(metocean_cfg.get("fallback_current_u_mps", 0.22)),
+        "v_current_mps": float(metocean_cfg.get("fallback_current_v_mps", 0.14)),
+        "u_wind_mps": float(metocean_cfg.get("fallback_wind_u_mps", 5.20)),
+        "v_wind_mps": float(metocean_cfg.get("fallback_wind_v_mps", 3.10)),
+        "wind_drift_factor": float(metocean_cfg.get("wind_drift_factor", 0.032)),
         "hindcast_hours": hindcast_hours
     }
 
@@ -140,21 +180,28 @@ def generate_mock_environment(
     # 4. Synthesize Comprehensive AIS Traffic Matrix
     ais_records = []
     base_bearing = selected_corridor["corridor_bearing"]
-    sample_intervals_min = list(range(-60, 65, 5))
+    sample_intervals_min = list(range(-sample_before_min, sample_after_min + 1, sample_step_min))
 
     # --- VESSEL 1: PRIME CULPRIT (Crude Tanker) ---
     # Intersects (x0, y0) at t0; decelerates and executes dynamic course yaw during dumping
-    mmsi_culprit = 477901234
+    culprit = dict(scenario_cfg.get("culprit") or {})
+    mmsi_culprit = int(culprit.get("mmsi", 477901234))
+    culprit_anomaly_halfwindow_min = float(culprit.get("anomaly_halfwindow_minutes", 15))
+    culprit_sog_discharge = float(culprit.get("sog_discharge_knots", 8.5))
+    culprit_sog_cruise = float(culprit.get("sog_cruise_knots", 13.8))
+    culprit_zigzag_amplitude_deg = float(culprit.get("zigzag_amplitude_deg", 14.0))
+    culprit_zigzag_period_min = float(culprit.get("zigzag_period_minutes", 5.0))
+    culprit_rot_amplitude = float(culprit.get("rot_amplitude", 12.0))
     for dt_min in sample_intervals_min:
         t_current = t0 + timedelta(minutes=dt_min)
 
-        # Operational anomaly: speed drops from 13.8 to 8.5 kn, yaw turns with ROT
-        if abs(dt_min) <= 15:
-            nominal_sog = 8.5
-            heading_offset = math.sin(dt_min / 5.0) * 14.0  # Dynamic zigzag yaw
-            rot_val = round(math.cos(dt_min / 5.0) * 12.0, 1)  # Rate of turn deg/min
+        # Operational anomaly: speed drop + zigzag yaw inside the anomaly window
+        if abs(dt_min) <= culprit_anomaly_halfwindow_min:
+            nominal_sog = culprit_sog_discharge
+            heading_offset = math.sin(dt_min / culprit_zigzag_period_min) * culprit_zigzag_amplitude_deg
+            rot_val = round(math.cos(dt_min / culprit_zigzag_period_min) * culprit_rot_amplitude, 1)
         else:
-            nominal_sog = 13.8
+            nominal_sog = culprit_sog_cruise
             heading_offset = 0.0
             rot_val = 0.0
 
@@ -207,13 +254,16 @@ def generate_mock_environment(
         })
 
     # --- VESSEL 3: SPATIAL DISTRACTOR (Container) ---
-    # Present at exact time t0, but 12 km parallel in adjacent TSS outbound lane
-    mmsi_parallel = 355672109
-    parallel_offset_bearing = (base_bearing + 90.0) % 360.0
-    lane_lat, lane_lon = geodesic_step(y0, x0, 12000.0, parallel_offset_bearing)
+    # Present at exact time t0, but in a parallel lane offset from the origin
+    parallel = dict(scenario_cfg.get("parallel_distractor") or {})
+    mmsi_parallel = int(parallel.get("mmsi", 355672109))
+    parallel_sog = float(parallel.get("sog_knots", 18.2))
+    parallel_offset_m = float(parallel.get("lateral_offset_m", 12000.0))
+    parallel_offset_bearing = (base_bearing + float(parallel.get("lane_offset_bearing_deg", 90.0))) % 360.0
+    lane_lat, lane_lon = geodesic_step(y0, x0, parallel_offset_m, parallel_offset_bearing)
     for dt_min in sample_intervals_min:
         t_current = t0 + timedelta(minutes=dt_min)
-        nominal_sog = 18.2
+        nominal_sog = parallel_sog
         dist_from_origin = (dt_min * 60.0) * (nominal_sog * KNOTS_TO_MPS)
         ship_lat, ship_lon = geodesic_step(lane_lat, lane_lon, dist_from_origin, base_bearing)
         j_lat, j_lon, j_sog = apply_sensor_jitter(ship_lat, ship_lon, nominal_sog)
@@ -235,13 +285,17 @@ def generate_mock_environment(
         })
 
     # --- VESSEL 4: DARK VESSEL SUSPECT (Bulk Carrier) ---
-    # Cuts off AIS transmitter 20 mins before origin, reappears 30 mins later
-    mmsi_dark = 636019888
+    # Cuts off its AIS transmitter before the origin window, reappears afterwards
+    dark = dict(scenario_cfg.get("dark_vessel") or {})
+    mmsi_dark = int(dark.get("mmsi", 636019888))
+    dark_sog = float(dark.get("sog_knots", 12.0))
+    dark_gap_start_min = float(dark.get("gap_start_minutes", -20))
+    dark_gap_end_min = float(dark.get("gap_end_minutes", 25))
     for dt_min in sample_intervals_min:
-        if -20 <= dt_min <= 25:
+        if dark_gap_start_min <= dt_min <= dark_gap_end_min:
             continue  # Blackout gap
         t_current = t0 + timedelta(minutes=dt_min)
-        nominal_sog = 12.0
+        nominal_sog = dark_sog
         dist_from_origin = (dt_min * 60.0) * (nominal_sog * KNOTS_TO_MPS)
         ship_lat, ship_lon = geodesic_step(y0, x0, dist_from_origin, base_bearing)
         j_lat, j_lon, j_sog = apply_sensor_jitter(ship_lat, ship_lon, nominal_sog)
@@ -262,9 +316,10 @@ def generate_mock_environment(
             "destination": "FUJAIRAH"
         })
 
-    # --- BACKGROUND CLUTTER GENERATOR (26 Additional Vessels) ---
-    # Generates anchored ships, slow trawlers, tugs, and crossing cargo vessels to test noise filters
-    clutter_types = [
+    # --- BACKGROUND CLUTTER GENERATOR ---
+    # Generates anchored ships, slow trawlers, tugs, and crossing cargo vessels to test noise filters.
+    # The default fleet profile below can be replaced wholesale via config (synthetic.background_fleet).
+    clutter_types = synth_cfg.get("background_fleet") or [
         {"type": "Fishing", "nav": "Engaged in fishing", "sog": (1.5, 4.0), "draught": 3.8, "dist": (6000, 22000)},
         {"type": "Tug", "nav": "Restricted maneuverability", "sog": (3.0, 7.5), "draught": 4.5, "dist": (4000, 18000)},
         {"type": "Cargo", "nav": "At anchor", "sog": (0.0, 0.4), "draught": 8.5, "dist": (10000, 25000)},
@@ -301,7 +356,7 @@ def generate_mock_environment(
 
             j_lat, j_lon, j_sog = apply_sensor_jitter(
                 ship_lat, ship_lon, 0.1 if is_stationary else nominal_sog,
-                sigma_m=4.0 if is_stationary else 10.0
+                sigma_m=jitter_sigma_m * 0.4 if is_stationary else jitter_sigma_m
             )
 
             ais_records.append({
@@ -329,9 +384,9 @@ def generate_mock_environment(
     with open(metocean_json_out, "w") as f:
         json.dump(metocean_profile, f, indent=4)
 
-    default_pipeline_path = os.path.join("data", "raw", "ais_data.csv")
-    os.makedirs(os.path.dirname(default_pipeline_path), exist_ok=True)
-    ais_df.to_csv(default_pipeline_path, index=False)
+    if pipeline_input_path:
+        os.makedirs(os.path.dirname(pipeline_input_path) or ".", exist_ok=True)
+        ais_df.to_csv(pipeline_input_path, index=False)
 
     print("\n" + "=" * 60)
     print(" COMPREHENSIVE SYNTHETIC MARITIME MATRIX COMPILED")
@@ -342,18 +397,39 @@ def generate_mock_environment(
     print(f"Primary Culprit MMSI      : {mmsi_culprit} (VALIANT_CARRIER)")
     print(f"Simulated AIS Archive     : {ais_csv_out}")
     print(f"Metocean Matrix Export    : {metocean_json_out}")
-    print(f"Synced Pipeline Input     : {default_pipeline_path}")
+    print(f"Synced Pipeline Input     : {pipeline_input_path or '(disabled)'}")
     print("=" * 60 + "\n")
 
     return metocean_profile
 
 
-if __name__ == "__main__":
-    test_polygon = "results/spill_polygon.geojson"
-    if not os.path.exists(test_polygon):
-        test_polygon = "outputs/55_detected.geojson"
+def _build_cli():
+    import argparse
 
-    if os.path.exists(test_polygon):
-        generate_mock_environment(test_polygon, output_dir="data/processed")
+    parser = argparse.ArgumentParser(description="Dynamic synthetic AIS/metocan scenario generator")
+    parser.add_argument("--slick", type=str, default="results/spill_polygon.geojson", help="Spill polygon GeoJSON (pixel-space or WGS84)")
+    parser.add_argument("--output-dir", type=str, default="data/processed")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--corridor", type=int, default=0, help="Region registry index for pixel-space anchoring")
+    parser.add_argument("--hindcast-hours", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--background-vessels", type=int, default=None)
+    parser.add_argument("--no-pipeline-sync", action="store_true", help="Do not mirror the AIS feed into the pipeline input path")
+    return parser
+
+
+if __name__ == "__main__":
+    args = _build_cli().parse_args()
+    if os.path.exists(args.slick):
+        generate_mock_environment(
+            args.slick,
+            output_dir=args.output_dir,
+            corridor_idx=args.corridor,
+            hindcast_hours=args.hindcast_hours,
+            random_seed=args.seed,
+            num_background_vessels=args.background_vessels,
+            config_path=args.config,
+            pipeline_input_path="" if args.no_pipeline_sync else None,
+        )
     else:
-        print(f"[!] Target test polygon not found. Place a valid GeoJSON at: {test_polygon}")
+        print(f"[!] Target test polygon not found. Place a valid GeoJSON at: {args.slick}")

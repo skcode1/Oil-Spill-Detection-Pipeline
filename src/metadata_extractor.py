@@ -1,17 +1,27 @@
 import os
 import re
+import sys
 from datetime import datetime, timezone
+from typing import Optional
+
 import rasterio
 from rasterio.warp import transform_bounds, transform
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-MAJOR_SHIPPING_CORRIDORS = [
-    {"name": "Strait of Malacca", "lat": 2.5000, "lon": 101.5000},
-    {"name": "Persian Gulf TSS", "lat": 26.5000, "lon": 53.0000},
-    {"name": "Singapore Strait", "lat": 1.2500, "lon": 103.9000},
-    {"name": "English Channel TSS", "lat": 50.2000, "lon": -0.5000},
-    {"name": "Gulf of Guinea", "lat": 4.5000, "lon": 6.0000},
-]
+from src.region_registry import get_region
+
+
+def _load_config(path: str = "config.yaml") -> dict:
+    """Loads config.yaml; absence/malformation degrades to built-in defaults."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            import yaml
+
+            return yaml.safe_load(handle) or {}
+    return {}
 
 
 def extract_acquisition_time(dataset: rasterio.DatasetReader, filename: str) -> str:
@@ -45,12 +55,30 @@ def extract_acquisition_time(dataset: rasterio.DatasetReader, filename: str) -> 
     return datetime.now(timezone.utc).isoformat()
 
 
-def extract_spatial_metadata(geotiff_path: str, patch_row_offset: int = 0, patch_col_offset: int = 0, patch_size: int = None) -> dict:
+def extract_spatial_metadata(
+    geotiff_path: str,
+    patch_row_offset: int = 0,
+    patch_col_offset: int = 0,
+    patch_size: int = None,
+    config_path: str = "config.yaml",
+    fallback_region: Optional[str] = None,
+    fallback_pad_deg: Optional[float] = None,
+) -> dict:
     """
     Extracts high-fidelity spatial bounds, center coordinates, and temporal anchors
     from full scenes or localized patch slices for hindcast/forecast physics modeling.
+
+    The non-georeferenced fallback anchor is resolved from the dynamic region
+    registry (config.yaml -> regions) instead of a hard-coded corridor list;
+    the fallback bounding-box padding is likewise config-driven.
     """
     filename = os.path.basename(geotiff_path)
+    meta_cfg = _load_config(config_path).get("metadata") or {}
+    fallback_name = fallback_region or meta_cfg.get("fallback_region", "Persian Gulf TSS")
+    pad_deg = float(
+        fallback_pad_deg if fallback_pad_deg is not None else meta_cfg.get("fallback_pad_deg", 0.02)
+    )
+    default_patch_size = int(meta_cfg.get("default_patch_size", 512))
 
     # Auto-extract row/column offsets from patch filename if present (e.g. "..._r1024_c512.tif")
     if patch_row_offset == 0 and patch_col_offset == 0:
@@ -59,7 +87,7 @@ def extract_spatial_metadata(geotiff_path: str, patch_row_offset: int = 0, patch
             patch_row_offset = int(match.group(1))
             patch_col_offset = int(match.group(2))
             if patch_size is None:
-                patch_size = 512
+                patch_size = default_patch_size
 
     with rasterio.open(geotiff_path) as dataset:
         crs = dataset.crs
@@ -67,17 +95,18 @@ def extract_spatial_metadata(geotiff_path: str, patch_row_offset: int = 0, patch
 
         # Case 1: Non-georeferenced or local pixel-space imagery
         if crs is None or dataset.transform.is_identity:
-            fallback = MAJOR_SHIPPING_CORRIDORS[1]  # Persian Gulf default
+            fallback = get_region(name=fallback_name, config_path=config_path)
             print(f"[!] Warning: No CRS found for {filename}. Defaulting to corridor anchor: {fallback['name']}")
             return {
                 "georeferenced": False,
                 "crs": None,
+                "fallback_region": fallback["name"],
                 "timestamp_utc": extract_acquisition_time(dataset, filename),
                 "center": (fallback["lat"], fallback["lon"]),
-                "bbox_wgs84": [fallback["lon"] - 0.02, fallback["lat"] - 0.02, fallback["lon"] + 0.02, fallback["lat"] + 0.02],
+                "bbox_wgs84": [fallback["lon"] - pad_deg, fallback["lat"] - pad_deg, fallback["lon"] + pad_deg, fallback["lat"] + pad_deg],
                 "copernicus_query": {
-                    "min_lat": fallback["lat"] - 0.02, "max_lat": fallback["lat"] + 0.02,
-                    "min_lon": fallback["lon"] - 0.02, "max_lon": fallback["lon"] + 0.02
+                    "min_lat": fallback["lat"] - pad_deg, "max_lat": fallback["lat"] + pad_deg,
+                    "min_lon": fallback["lon"] - pad_deg, "max_lon": fallback["lon"] + pad_deg
                 }
             }
 
@@ -127,8 +156,16 @@ def extract_spatial_metadata(geotiff_path: str, patch_row_offset: int = 0, patch
 
 
 if __name__ == "__main__":
-    sample_file = "data/raw/SAR_training/sentinel/image/sample_scene.tif"
-    if os.path.exists(sample_file):
-        metadata = extract_spatial_metadata(sample_file)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Dynamic SAR scene metadata extractor")
+    parser.add_argument("--input", type=str, required=True, help="GeoTIFF scene or patch path")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    args = parser.parse_args()
+
+    if os.path.exists(args.input):
+        metadata = extract_spatial_metadata(args.input, config_path=args.config)
         print("\nExtracted Spatial Metadata:")
         print(metadata)
+    else:
+        print(f"[!] Input not found: {args.input}")

@@ -22,3 +22,5 @@ rasterio
 shapely
 python-multipart
 tifffile
+pyyaml
+pyproj
