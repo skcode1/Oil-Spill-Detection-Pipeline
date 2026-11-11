@@ -1,26 +1,52 @@
-torch
-torchvision
-segmentation-models-pytorch
-rasterio
-shapely
-geopandas
-pandas
-numpy
-matplotlib
-streamlit
-pydeck
-pillow
-opencv-python-headless
-geopandas
-shapely
-rasterio
-fastapi
-uvicorn
-opencv-python-headless
-geopandas
-rasterio
-shapely
-python-multipart
-tifffile
-pyyaml
-pyproj
+# =============================================================================
+# Oil-Spill-Detection-Pipeline — pinned production requirements
+# -----------------------------------------------------------------------------
+# Validated against the project venv (torch 2.14.0, Python 3.12).
+# All direct dependencies carry == pins so deployments reproduce bit-for-bit.
+# Naming follows the canonical PyPI project names (pip freeze normalises
+# "segmentation-models-pytorch" to "segmentation_models_pytorch" and "pyyaml"
+# to "PyYAML"; both spellings resolve to the same distribution).
+# NOTE: packages marked [smp] below therefore pin the distribution name
+# reported by `pip freeze`; requirements resolvers accept underscores.
+# =============================================================================
+
+# --- deep learning -----------------------------------------------------------
+torch==2.14.0
+torchvision==0.29.0
+segmentation-models-pytorch==0.5.0
+timm==1.0.29
+safetensors==0.8.0
+
+# --- geospatial / imagery ----------------------------------------------------
+rasterio==1.5.1
+geopandas==1.1.4
+shapely==2.1.2
+pyproj==3.7.2
+tifffile==2026.8.23
+pillow==12.3.0
+opencv-python-headless==5.0.0.93
+
+# --- data / numerics ---------------------------------------------------------
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+pyarrow==25.0.1
+
+# --- api ---------------------------------------------------------------------
+fastapi==0.141.1
+uvicorn==0.52.4
+python-multipart==0.0.32
+pydantic==2.13.5
+pyyaml==6.0.3
+httpx==0.28.1
+
+# --- drift physics -----------------------------------------------------------
+opendrift==1.14.12
+netCDF4==1.7.4
+xarray==2026.7.0
+adios-db==1.2.7
+
+# --- dashboard (streamlit app in src/app.py) ---------------------------------
+# Optional: only needed to run the Streamlit dashboard. Installed via
+# requirements-dashboard.txt so API/Docker images stay lean.
+matplotlib==3.11.2

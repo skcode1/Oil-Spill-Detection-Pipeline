@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import rasterio
-from rasterio.warp import transform_bounds, transform
+from rasterio.warp import transform_bounds
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -26,7 +26,7 @@ def _load_config(path: str = "config.yaml") -> dict:
 
 def extract_acquisition_time(dataset: rasterio.DatasetReader, filename: str) -> str:
     """
-    Extracts the acquisition UTC timestamp from raster metadata tags 
+    Extracts the acquisition UTC timestamp from raster metadata tags
     or parses standard Sentinel-1 filename naming conventions.
     """
     # 1. Inspect TIFF metadata tags
@@ -115,7 +115,7 @@ def extract_spatial_metadata(
             # Compute real projected coordinates from top-left to bottom-right of patch
             px_left, py_top = transform_matrix * (patch_col_offset, patch_row_offset)
             px_right, py_bottom = transform_matrix * (patch_col_offset + patch_size, patch_row_offset + patch_size)
-            
+
             src_min_x, src_max_x = min(px_left, px_right), max(px_left, px_right)
             src_min_y, src_max_y = min(py_bottom, py_top), max(py_bottom, py_top)
         else:

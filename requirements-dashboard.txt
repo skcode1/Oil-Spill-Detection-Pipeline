@@ -1,0 +1,6 @@
+# Dashboard extras for src/app.py (Streamlit visualisation only).
+# Install with: pip install -r requirements-dashboard.txt
+-r requirements.txt
+matplotlib==3.11.2
+streamlit==1.64.0
+pydeck==0.9.3

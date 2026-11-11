@@ -40,8 +40,8 @@ import bz2
 import csv
 import gc
 import gzip
-import lzma
 import logging
+import lzma
 import os
 import re
 from dataclasses import dataclass, replace

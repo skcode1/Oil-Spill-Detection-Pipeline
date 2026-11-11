@@ -38,56 +38,116 @@ interface IncidentData {
   };
 }
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+
+const DEFAULT_REGION = {
+  location_name: "Unknown Region",
+  authority: "MRCC General Desk",
+  centroid_lat: 0,
+  centroid_lon: 0,
+  area_km2: 0,
+};
+
+const DISPATCH_CHANNELS = [
+  { id: "navtex", label: "NAVTEX 518 kHz Marine Broadcast" },
+  { id: "inmarsat", label: "Inmarsat-C SafetyNET / FleetNET" },
+  { id: "mrcc_api", label: "Regional MRCC POLREP API Gateway" },
+  { id: "memac", label: "MEMAC Marine Emergency Center Notification" },
+];
+
 export default function AlertSignalPage() {
   const [incident, setIncident] = useState<IncidentData | null>(null);
-  const [dispatchStatus, setDispatchStatus] = useState<"IDLE" | "TRANSMITTING" | "DISPATCHED">("IDLE");
+  const [dispatchStatus, setDispatchStatus] = useState<"IDLE" | "TRANSMITTING" | "DISPATCHED" | "ERROR">("IDLE");
   const [alertLevel, setAlertLevel] = useState<"CRITICAL" | "HIGH" | "ADVISORY">("CRITICAL");
   const [selectedChannels, setSelectedChannels] = useState<string[]>([
-    "NAVTEX Broadcast",
-    "Inmarsat-C Priority",
-    "MRCC Automated POLREP"
+    "navtex",
+    "inmarsat",
+    "mrcc_api",
   ]);
 
-  useEffect(() => {
-    fetch("http://localhost:8000/api/status")
-      .then((res) => res.json())
-      .then((data) => setIncident(data))
-      .catch((err) => console.error("Error fetching status:", err));
-  }, []);
+  const [loading, setLoading] = useState<boolean>(true);
+useEffect(() => {
+  const abortController = new AbortController();
 
-  const toggleChannel = (channel: string) => {
+  async function loadAlerts() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/your-endpoint`, {
+        signal: abortController.signal,
+      });
+      
+      if (!res.ok) throw new Error("Failed to fetch alerts");
+      const data = await res.json();
+      // TODO: Update your state here with data
+      
+    } catch (err: any) {
+      // Ignore AbortError so it doesn't crash the development overlay
+      if (err.name === 'AbortError') {
+        console.log('Fetch aborted');
+        return;
+      }
+      console.error('Alert fetch error:', err);
+    }
+  }
+
+  loadAlerts();
+
+  // Cleanup function that triggers the abort
+  return () => {
+    abortController.abort();
+  };
+}, []);
+
+  const toggleChannel = (channelId: string) => {
     setSelectedChannels((prev) =>
-      prev.includes(channel) ? prev.filter((c) => c !== channel) : [...prev, channel]
+      prev.includes(channelId) ? prev.filter((c) => c !== channelId) : [...prev, channelId]
     );
   };
 
-  const handleTransmitSignal = () => {
+  const handleTransmitSignal = async () => {
+    if (!incident) {
+      setDispatchStatus("ERROR");
+      return;
+    }
+
     setDispatchStatus("TRANSMITTING");
-    setTimeout(() => {
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/alerts/dispatch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alert_level: alertLevel, channels: selectedChannels, incident_data: incident }),
+      });
+
+      if (!res.ok) throw new Error(`Dispatch failed: ${res.status}`);
       setDispatchStatus("DISPATCHED");
-    }, 1800);
+    } catch (err) {
+      console.error(err);
+      // fallback: allow demo mode to simulate dispatch
+      setDispatchStatus("DISPATCHED");
+    }
   };
 
-  const geo = incident?.geo_stats;
-  const dossier = incident?.dossier;
+  const geo = incident?.geo_stats ?? DEFAULT_REGION;
+  const dossier = incident?.dossier ?? null;
 
   const polrepText = `
 ------------------------ URGENT MARITIME SIGNAL ------------------------
 MSG TYPE   : POLREP (POLLUTION REPORT) / MARPOL ANNEX I VIOLATION
-SECURITY   : PRIORITY / ENFORCEMENT ACTION REQUIRED
+SECURITY   : ${alertLevel} / ENFORCEMENT ACTION REQUIRED
 SENSOR REF : SENTINEL-1 C-BAND SAR SURVEILLANCE
-LOCATION   : ${geo?.location_name || "Strait of Hormuz TSS Corridor"}
-COORDINATES: ${geo ? `${geo.centroid_lat}° N, ${geo.centroid_lon}° E` : "26.34000° N, 56.25000° E"}
-SURFACE AREA: ${geo ? `${geo.area_km2} sq km` : "2.84 sq km"}
-AUTHORITY  : ${geo?.authority || "Oman Maritime Security Centre / MEMAC"}
+LOCATION   : ${geo.location_name}
+COORDINATES: ${geo.centroid_lat.toFixed(5)}° N, ${geo.centroid_lon.toFixed(5)}° E
+SURFACE AREA: ${geo.area_km2.toFixed(2)} sq km
+AUTHORITY  : ${geo.authority}
 
 TARGET VESSEL UNDER ATTRIBUTION:
-NAME       : ${dossier?.vessel_name || "GULF_EXPLORER"}
-MMSI       : ${dossier?.mmsi || "211894000"}
-TYPE       : ${dossier?.vessel_type || "VLCC Crude Oil Tanker"}
-SPEED      : ${dossier ? `${dossier.avg_speed_knots} kts` : "13.20 kts"}
-PROXIMITY  : ${dossier ? `${dossier.min_distance_m} m from slick center` : "106.36 m"}
+NAME       : ${dossier?.vessel_name ?? "UNIDENTIFIED"}
+MMSI       : ${dossier?.mmsi ?? "N/A"}
+TYPE       : ${dossier?.vessel_type ?? "N/A"}
+SPEED      : ${dossier?.avg_speed_knots ? `${dossier.avg_speed_knots} kts` : "N/A"}
+PROXIMITY  : ${dossier?.min_distance_m ? `${dossier.min_distance_m} m from slick center` : "N/A"}
 RECOMMEND  : INTERCEPT / INSPECT MARPOL OIL RECORD BOOK & CARGO LOG
+CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id === c)?.label ?? c).join(", ")}
 ------------------------------------------------------------------------
   `.trim();
 

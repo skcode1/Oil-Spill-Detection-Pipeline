@@ -1,18 +1,17 @@
-import os
 import json
 import logging
 import math
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, Tuple, List
+import os
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import geopandas as gpd
+import numpy as np
 import pyproj
-from shapely.geometry import Point, Polygon, MultiPolygon, MultiPoint
-from shapely.ops import unary_union
-
 from opendrift.models.openoil import OpenOil
 from opendrift.readers import reader_netCDF_CF_generic
+from shapely.geometry import MultiPoint, MultiPolygon, Point, Polygon
+from shapely.ops import unary_union
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("OpenDriftEngine")
@@ -93,7 +92,7 @@ class OpenDriftHindcastEngine:
         gdf = gpd.read_file(geojson_path)
         if gdf.empty:
             raise ValueError(f"Empty GeoJSON provided: {geojson_path}")
-        
+
         geom = unary_union(gdf.geometry)
         if isinstance(geom, MultiPolygon):
             geom = max(geom.geoms, key=lambda a: a.area)
@@ -156,7 +155,7 @@ class OpenDriftHindcastEngine:
     ) -> Dict[str, Any]:
         """
         Executes negative time-step Lagrangian tracking to evaluate the slick's origin.
-        
+
         Returns:
             Dict containing origin centroid, bounding error ellipse parameters,
             and trajectory outputs compatible with the downstream AIS pruner.
@@ -175,7 +174,7 @@ class OpenDriftHindcastEngine:
         )
 
         nc_output = os.path.join(self.output_dir, "hindcast_simulation.nc")
-        
+
         # Backward simulation is triggered by negative duration and negative time_step
         sim.run(
             duration=timedelta(hours=-hindcast_hours),
@@ -187,7 +186,7 @@ class OpenDriftHindcastEngine:
         # Extract terminal backward states (t0)
         final_lons = sim.get_property("lon")[0][-1, :]
         final_lats = sim.get_property("lat")[0][-1, :]
-        
+
         # Filter valid, unstranded particles
         valid_mask = ~np.isnan(final_lons) & ~np.isnan(final_lats)
         clean_lons = final_lons[valid_mask]
@@ -350,6 +349,8 @@ class OpenDriftHindcastEngine:
         result = {
             "forecast_geojson": forecast_geojson_path,
             "forecast_nc": nc_output,
+            "forecast_lon": float(np.median(clean_lons)),
+            "forecast_lat": float(np.median(clean_lats)),
             "particles_tracked": len(clean_lons),
             "uncertainty": uncertainty_ellipse,
             "forecast_end_time": (release_time + timedelta(hours=forecast_hours)).isoformat()

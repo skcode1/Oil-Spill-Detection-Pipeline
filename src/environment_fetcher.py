@@ -21,7 +21,7 @@ import os
 import re
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -131,6 +131,8 @@ class MetoceanDataFetcher:
             timestamp = query["start"] if match.group(1) == "start" else query["end"]
             return timestamp.strftime(match.group(2))
 
+        template = self.templates[dataset_key]
+        fields = dict(query["bbox"])
         expanded = template
         for name, value in fields.items():
             if isinstance(value, str):

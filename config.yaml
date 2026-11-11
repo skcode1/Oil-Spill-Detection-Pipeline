@@ -1,9 +1,14 @@
 paths:
   # Input datasets & checkpoints
-  raw_sar_dir: "data/raw/SAR_training/sentinel"
-  test_sar_scene: "data/raw/SAR_training/sentinel/image"
+  raw_sar_dir: "data/raw/zenodo_part3"
+  train_split: "data/processed/train"
+  val_split: "data/processed/val"
+  test_split: "data/processed/test"
+  test_sar_scene: "data/raw/zenodo_part3/Images/Oil"
   ais_csv: "data/raw/ais_data.csv"
-  model_checkpoint: "models/sar_unet_best.pth"
+  # .pth is a degenerate checkpoint (input-independent outputs); .bak is the
+  # last sane checkpoint. See README "Model checkpoint" for the diagnosis.
+  model_checkpoint: "models/oil_spill_segmentation_model.pth.bak"
 
   # Custom Separate Output Artifacts Folder
   output_dir: "results"
@@ -14,23 +19,67 @@ model:
   architecture: "unet"
   encoder: "resnet34"
   encoder_weights: null
-  in_channels: 1
-  classes: 1
+  in_channels: 3                    # [VV, VH, VV+VH composite] — model expects 3-channel input
+  classes: 3                        # Background / No-Oil (0), Oil Spill (1), Lookalike (2)
+  class_names: ["background", "oil_spill", "lookalike"]
+  oil_class_index: 1
+  lookalike_class_index: 2
+  background_class_index: 0
   input_size: [256, 256]
-  confidence_threshold: 0.50
+  # 0.90 is the operating point that keeps no-oil scenes free of false
+  # slicks with the current checkpoint (see README "Threshold calibration").
+  confidence_threshold: 0.90
 
 inference:
   batch_size: 16
-  stride: 128
-  tile_size: 256
+  # Tile/stride match the 512-px training-chip footprint; combined with the
+  # per-tile min-max normalisation in ModelService this roughly doubles
+  # oil-slick IoU versus whole-scene normalisation at 256/128.
+  stride: 256
+  tile_size: 512
+  # Normalisation mode: "per_tile" (matches training chips) or "scene"
+  # (whole-scene min-max).  OILSPILL_NORMALISATION env var overrides.
+  normalisation: "per_tile"
   min_spill_area_pixels: 50
   crs: "EPSG:4326"
+  morphological_cleanup: true
+  morphology_kernel_size: 3     # elliptical speckle-suppression kernel (odd int); OILSPILL_MORPH_KERNEL wins
+  contour_epsilon_fraction: 0.005  # approxPolyDP epsilon as fraction of perimeter; OILSPILL_CONTOUR_EPSILON wins
+  save_artifacts: true
+  preview_max_edge: 512
+
+# Post-processing lookalike filtering: geometric, textural, and contextual
+# heuristics to distinguish true petroleum discharges from false-positive
+# lookalikes (biogenic films, wind slicks, atmospheric artifacts, etc).
+lookalike_filter:
+  enabled: true
+  # Geometry-based heuristics
+  min_confirmed_area_px: 200.0         # Minimum area for confirmed true oil
+  max_confirmed_elongation: 5.0        # Max length/width ratio
+  min_confirmed_solidity: 0.5          # Min contour_area/convex_hull_area
+  # Boundary gradient heuristics
+  min_edge_gradient_magnitude: 10.0    # Minimum edge sharpness
+  edge_sample_count: 32                # Contour sampling resolution
+  # Spatial coherence & morphology
+  max_confirmed_bbox_fill_fraction: 0.8  # Max area/bbox ratio (uniform patterns = lookalike)
+  max_confirmed_component_count: 2     # Max connected components
+  # Confidence scoring
+  min_confident_scene_pixels: 2000000  # Small test chips get downgraded
+  max_confirmed_oil_coverage_fraction: 0.05  # High coverage flags wind slicks
+  # Metadata context
+  detect_lookalike_dataset_paths: true # Detect "lookalike" in path
+  # Overall sensitivity
+  heuristic_threshold_count: 2         # Num heuristics that must trigger
+  use_lookalike_status: true           # Use "Lookalike" status vs confidence downgrade
 
 ais:
   time_window_hours: 6
   buffer_distance_m: 5000
   metric_crs: "EPSG:3857"
   geographic_crs: "EPSG:4326"
+  # Default AIS CSV for attribution when request doesn't specify one.
+  # Used only for geographic scenes; pixel-space scenes skip attribution.
+  default_csv: "data/processed/simulated_ais_traffic.csv"
 
 map_dashboard:
   mapbox_style: "carto-positron"
@@ -85,13 +134,32 @@ metocean:
   wind_drift_factor: 0.032
   horizontal_diffusivity: 10.0
   weathering_model: "adios"
-  release_seed_buffer_deg: 0.01
+  point_seed_buffer_deg: 0.01   # legacy key 'release_seed_buffer_deg' still honoured
   confidence_level: 0.95
+  max_steps: 20000              # integration-step safety cap; OILSPILL_MAX_STEPS wins
+  max_endpoint_samples: 200     # response payload cap; OILSPILL_MAX_ENDPOINTS wins
+  # Window lengths (hours) the pipeline uses when a request does not override
+  # them: the backward hindcast aims at the source, the forward forecast
+  # (OpenDrift/OpenOil when the NetCDF readers are readable) projects the
+  # predicted extent and shoreline threat.
   fallback_hindcast_hours: 4.0
+  fallback_forecast_hours: 24.0
   fallback_current_u_mps: 0.22
   fallback_current_v_mps: 0.14
   fallback_wind_u_mps: 5.20
   fallback_wind_v_mps: 3.10
+  # Per-incident metocean manifest, preferred over the constants above whenever it
+  # exists and parses (app/services/drift_service.py::MetoceanField.from_environment_json).
+  # Two shapes are accepted: one uniform vector
+  #   {u_current_mps, v_current_mps, u_wind_mps, v_wind_mps, timestamp_utc}
+  # or a time series the engine interpolates in time
+  #   {samples: [{timestamp_utc, u_current_mps, v_current_mps, u_wind_mps, v_wind_mps}, ...],
+  #    wind_drift_factor: 0.032}
+  # The file shipped in data/processed/ holds the synthetic scenario's constants, so
+  # it reproduces the fallback vectors exactly; replace it with real Copernicus/ERA5
+  # samples (metocean.datasets + src/environment_fetcher.py) for operational runs.
+  # Override the path with OILSPILL_METOCEAN_JSON, or set it empty to disable.
+  environment_json: "data/processed/metocean_environment.json"
   # Incident-specific dataset templates (src/environment_fetcher.py);
   # {min_lat} {max_lat} {min_lon} {max_lon} {start} {end} placeholders,
   # plus strftime forms such as {start:%Y-%m-%d}.
@@ -134,13 +202,50 @@ preprocessing:
   stride: 128
   output_dir: "data/processed"
 
+# =============================================================
+# SAR PRODUCTION-GRADE AUGMENTATIONS (src/dataset.py)
+# -------------------------------------------------------------
+# Satellite SAR backscatter changes drastically with wind speed,
+# incidence angle, and acquisition geometry.  These augmentations
+# prevent the model from failing when deployed on imagery from a
+# different satellite or day.  All are disabled during validation
+# and inference; only active during training.
+# =============================================================
+augmentation:
+  # Multiplicative Gamma speckle noise (core SAR sensor artifact)
+  speckle_noise: true
+  speckle_noise_var: 0.02          # multiplicative noise variance
+
+  # Gaussian blur to simulate azimuth thermal smearing / antenna pattern edge effects
+  gaussian_blur: true
+  gaussian_blur_ksize: 3          # odd kernel size
+
+  # Radiometric brightness / contrast jitter (simulates incidence angle & wind speed drift)
+  brightness_contrast: true
+  brightness_limit: 0.15          # ±15 % multiplicative brightness shift
+  contrast_limit: 0.2            # ±20 % contrast scaling
+
+  # Geometric flips (SAR is symmetric under horizontal / vertical reflection)
+  horizontal_flip: true
+  horizontal_flip_p: 0.5
+  vertical_flip: true
+  vertical_flip_p: 0.5
+
+  # Normalization
+  norm_mean: [0.5, 0.5, 0.5]      # per-channel mean (maps [0,1] -> [-1,1])
+  norm_std: [0.5, 0.5, 0.5]
+
 # U-Net training profile (src/train.py).
 training:
-  epochs: 15
+  epochs: 50
   batch_size: 16
   learning_rate: 0.001
   weight_decay: 0.0001
-  train_fraction: 0.85
+  train_fraction: 0.85          # used only when reading a single flat dir
+  loss:
+    dice_weight: 0.5
+    focal_weight: 1.0
+    focal_gamma: 2.0
 
 # SAR scene radiometric validation thresholds (backend/main.py).
 validation:
@@ -157,3 +262,17 @@ backend:
   base_url: "http://localhost:8000"
   python_executable: null    # defaults to sys.executable
   default_location_name: null  # defaults to the first configured region name
+
+# FastAPI app served from app/main.py: uvicorn app.main:app --reload
+# OILSPILL_PORT and OILSPILL_CORS_ORIGINS override port and CORS at runtime.
+api:
+  title: "Marine Oil Spill Detection & Vessel Attribution API"
+  version: "1.0.0"
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins: ["*"]        # list, or a comma-separated string
+  max_upload_mb: 200         # upload cap in MiB; OILSPILL_MAX_UPLOAD_BYTES (bytes) wins
+  description: >-
+    Detection of oil slicks in satellite imagery, Lagrangian drift
+    (backtracing and forecasting) and AIS candidate pruning with
+    explainable vessel attribution scoring.

@@ -1,15 +1,16 @@
-import os
 import glob
 import json
-import sys
-import yaml
-import subprocess
+import os
 import shutil
+import subprocess
+import sys
+
 import cv2
-import numpy as np
-import streamlit as st
 import geopandas as gpd
+import numpy as np
 import pydeck as pdk
+import streamlit as st
+import yaml
 
 st.set_page_config(
     page_title="Maritime Oil Spill & AIS Surveillance",
@@ -28,7 +29,7 @@ paths_cfg = config.get("paths") or {}
 map_cfg = config.get("map_dashboard") or {}
 RAW_SAR_DIR = paths_cfg.get("test_sar_scene", "data/raw/SAR_training/sentinel/image")
 OUTPUT_DIR = paths_cfg.get("output_dir", "results")
-MODEL_PATH = paths_cfg.get("model_checkpoint", "models/sar_unet_best.pth")
+MODEL_PATH = paths_cfg.get("model_checkpoint", "models/oil_spill_segmentation_model.pth")
 SPILL_PATH = os.path.join(OUTPUT_DIR, "spill_polygon.geojson")
 CULPRIT_PATH = os.path.join(OUTPUT_DIR, "culprit_vessel.geojson")
 LATEST_MASK_PATH = os.path.join(OUTPUT_DIR, "latest_mask.png")
@@ -151,7 +152,7 @@ if input_mode == "Select from Dataset":
         st.sidebar.warning("No images found in raw dataset directory.")
 else:
     uploaded_file = st.sidebar.file_uploader(
-        "Upload SAR Image", 
+        "Upload SAR Image",
         type=["png", "jpg", "jpeg", "tif", "tiff", "PNG", "JPG", "JPEG", "TIF", "TIFF"],
         key="sar_uploader"
     )
@@ -172,7 +173,7 @@ if st.sidebar.button("🚀 Run Full Pipeline", type="primary"):
     if selected_image_path and os.path.exists(selected_image_path):
         # Step 0: Validate SAR Data Authenticity
         is_valid_sar, message = validate_sar_image(selected_image_path)
-        
+
         if not is_valid_sar:
             # Purge any stale outputs
             for old_file in [SPILL_PATH, CULPRIT_PATH, LATEST_MASK_PATH]:

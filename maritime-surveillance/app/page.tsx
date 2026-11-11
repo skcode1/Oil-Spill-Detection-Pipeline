@@ -6,7 +6,6 @@ import dynamic from "next/dynamic";
 import {
   Satellite,
   Ship,
-  Compass,
   Upload,
   Play,
   CheckCircle2,
@@ -17,76 +16,83 @@ import {
   Gauge,
   Crosshair,
   Activity,
-  MapPin,
-  Radio
+  Radio,
+  HelpCircle,
 } from "lucide-react";
 
 const SurveillanceMap = dynamic(() => import("../src/SurveillanceMap"), {
   ssr: false,
+  loading: () => (
+    <div className="flex h-full w-full items-center justify-center bg-slate-950 text-xs text-slate-400">
+      Loading Mapping Engine...
+    </div>
+  ),
 });
 
-const SAR_ACCEPTED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"];
+const SAR_ACCEPTED_EXTENSIONS = [".tif", ".tiff"];
+const SAR_ACCEPTED_MIME_TYPES = new Set(["image/tiff", "image/x-tiff", "application/octet-stream"]);
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+const PIPELINE_UPLOAD_URL = `${API_BASE_URL}/pipeline/upload`;
 
-function isValidSarUpload(file: File | null) {
+function isValidSarUpload(file: File | null): boolean {
   if (!file) return false;
   const fileName = file.name.toLowerCase();
-  return SAR_ACCEPTED_EXTENSIONS.some((ext) => fileName.endsWith(ext));
+  const hasAllowedExtension = SAR_ACCEPTED_EXTENSIONS.some((ext) => fileName.endsWith(ext));
+  const hasAllowedMime = !file.type || SAR_ACCEPTED_MIME_TYPES.has(file.type.toLowerCase());
+  return hasAllowedExtension && hasAllowedMime;
 }
 
-async function isAuthenticSarImage(file: File | null): Promise<boolean> {
+function isUploadCandidate(file: File | null): boolean {
   if (!file || !isValidSarUpload(file)) return false;
+  return file.size > 0;
+}
 
-  const objectUrl = URL.createObjectURL(file);
+async function isAuthenticSarImage(file: File): Promise<boolean> {
+  if (!isUploadCandidate(file)) return false;
+
   try {
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("Failed to decode image"));
-      img.src = objectUrl;
-    });
+    const slice = file.slice(0, 8);
+    const buffer = await slice.arrayBuffer();
+    const view = new Uint8Array(buffer);
+    const isTiffLE = view[0] === 0x49 && view[1] === 0x49 && view[2] === 0x2a && view[3] === 0x00;
+    const isTiffBE = view[0] === 0x4d && view[1] === 0x4d && view[2] === 0x00 && view[3] === 0x2a;
+    const isBigTiffLE = view[0] === 0x49 && view[1] === 0x49 && view[2] === 0x2b && view[3] === 0x00;
+    const isBigTiffBE = view[0] === 0x4d && view[1] === 0x4d && view[2] === 0x00 && view[3] === 0x2b;
 
-    const width = image.naturalWidth;
-    const height = image.naturalHeight;
-    if (width < 32 || height < 32 || width > 512 || height > 512) {
-      return false;
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return false;
-
-    ctx.drawImage(image, 0, 0);
-    const { data } = ctx.getImageData(0, 0, width, height);
-
-    let channelDiffTotal = 0;
-    let graySum = 0;
-    let squaredSum = 0;
-    let pixelCount = 0;
-
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      channelDiffTotal += Math.abs(r - g) + Math.abs(g - b) + Math.abs(r - b);
-      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      graySum += gray;
-      squaredSum += gray * gray;
-      pixelCount += 1;
-    }
-
-    const rgbDrift = channelDiffTotal / (pixelCount * 3);
-    const mean = graySum / pixelCount;
-    const variance = squaredSum / pixelCount - mean * mean;
-    const std = Math.sqrt(Math.max(variance, 0));
-
-    return rgbDrift < 8 && std >= 5 && std <= 90 && mean >= 10 && mean <= 180;
-  } catch {
+    return isTiffLE || isTiffBE || isBigTiffLE || isBigTiffBE;
+  } catch (err) {
+    console.error("Error inspecting SAR TIFF header:", err);
     return false;
-  } finally {
-    URL.revokeObjectURL(objectUrl);
   }
+}
+
+function geojsonBounds(featureCollection: any): number[] | null {
+  const coords: Array<[number, number]> = [];
+  for (const feature of featureCollection?.features ?? []) {
+    const geometry = feature?.geometry;
+    const polygons =
+      geometry?.type === "Polygon"
+        ? [geometry.coordinates]
+        : geometry?.type === "MultiPolygon"
+          ? geometry.coordinates
+          : [];
+    for (const ring of polygons.flat()) {
+      for (const point of ring) {
+        if (Array.isArray(point) && point.length >= 2) {
+          coords.push([Number(point[0]), Number(point[1])]);
+        }
+      }
+    }
+  }
+  if (coords.length === 0) return null;
+  const lons = coords.map((c) => c[0]);
+  const lats = coords.map((c) => c[1]);
+  return [
+    Math.min(...lons),
+    Math.min(...lats),
+    Math.max(...lons),
+    Math.max(...lats),
+  ];
 }
 
 export default function MaritimeDashboard() {
@@ -94,7 +100,7 @@ export default function MaritimeDashboard() {
   const [inputMode, setInputMode] = useState<"dataset" | "upload">("dataset");
   const [selectedScene, setSelectedScene] = useState<string>("");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [threshold, setThreshold] = useState<number>(0.5);
+  const [threshold, setThreshold] = useState<number>(0.90);
 
   const [showSpill, setShowSpill] = useState(true);
   const [showVessel, setShowVessel] = useState(true);
@@ -118,18 +124,23 @@ export default function MaritimeDashboard() {
   }, [uploadFile]);
 
   useEffect(() => {
-    fetch("http://localhost:8000/api/scenes")
-      .then((res) => res.json())
-      .then((data) => {
-        setScenes(data.scenes || []);
-        if (data.scenes?.length > 0) setSelectedScene(data.scenes[0]);
-      })
-      .catch((err) => console.error("API error:", err));
+    const controller = new AbortController();
 
-    fetch("http://localhost:8000/api/status")
-      .then((res) => res.json())
-      .then((data) => setPipelineState(data))
-      .catch((err) => console.error("Status error:", err));
+    const loadStatus = async () => {
+      try {
+        const scenesRes = await fetch(`${API_BASE_URL}/scenes`, { signal: controller.signal });
+        const scenesData = scenesRes.ok ? await scenesRes.json() : { scenes: [] };
+        const scenePaths = (scenesData.scenes || []).map((s: any) => s.path).filter(Boolean);
+        setScenes(scenePaths);
+        if (scenePaths.length > 0) setSelectedScene(scenePaths[0]);
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        console.error("Scenes load error:", err);
+      }
+    };
+
+    void loadStatus();
+    return () => controller.abort();
   }, []);
 
   const handleRunPipeline = async () => {
@@ -138,92 +149,198 @@ export default function MaritimeDashboard() {
 
     if (inputMode === "upload") {
       if (!uploadFile || !isValidSarUpload(uploadFile)) {
-        setPipelineState({
-          success: false,
-          validation_msg: "Invalid SAR image: only Sentinel-1 SAR files (.png, .jpg, .jpeg, .tif, .tiff) are accepted.",
-          has_spill: false,
-          geo_stats: null,
-          dossier: null,
-          spill_geojson: null,
-          culprit_geojson: null,
-        });
-        setValidationError("Invalid SAR image: only Sentinel-1 SAR files (.png, .jpg, .jpeg, .tif, .tiff) are accepted.");
+        setPipelineState(null);
+        setValidationError("Invalid SAR image: only GeoTIFF SAR scenes (.tif, .tiff) are accepted.");
         setLoading(false);
         return;
       }
 
-      const isRealSar = await isAuthenticSarImage(uploadFile);
-      if (!isRealSar) {
-        setPipelineState({
-          success: false,
-          validation_msg: "Invalid SAR image: only authentic SAR scenes matching the dataset are accepted.",
-          has_spill: false,
-          geo_stats: null,
-          dossier: null,
-          spill_geojson: null,
-          culprit_geojson: null,
-        });
-        setValidationError("Invalid SAR image: only authentic SAR scenes matching the dataset are accepted.");
+      const isAcceptedUpload = isUploadCandidate(uploadFile);
+      if (!isAcceptedUpload) {
+        setPipelineState(null);
+        setValidationError("Invalid SAR image: please choose a non-empty GeoTIFF SAR scene (.tif, .tiff).");
         setLoading(false);
         return;
       }
     }
 
-    const formData = new FormData();
-    formData.append("mode", inputMode);
-    formData.append("threshold", threshold.toString());
+    const pipelineOptions = {
+      confidence_threshold: threshold,
+      run_drift: true,
+      run_forecast: true,
+      run_attribution: true,
+    };
 
-    if (inputMode === "dataset") {
-      formData.append("selected_scene", selectedScene);
-    } else if (uploadFile) {
-      formData.append("file", uploadFile);
-    }
+    const controller = new AbortController();
 
     try {
-      const res = await fetch("http://localhost:8000/api/run-pipeline", {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-      if (!data.success) {
-        setValidationError(data.validation_msg);
+      let res: Response;
+      if (inputMode === "dataset") {
+        if (!selectedScene) {
+          setValidationError("Select a scene from the dataset first.");
+          setLoading(false);
+          return;
+        }
+        res = await fetch(`${API_BASE_URL}/pipeline`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            path: selectedScene,
+            ...pipelineOptions,
+          }),
+          signal: controller.signal,
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("file", uploadFile!);
+        formData.append("options", JSON.stringify(pipelineOptions));
+        res = await fetch(PIPELINE_UPLOAD_URL, {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
       }
+
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        const errorBlock = typeof data?.error === "object" ? data.error : null;
+        const detail =
+          typeof data?.detail === "string"
+            ? data.detail
+            : Array.isArray(data?.detail)
+              ? (data.detail[0]?.msg ?? "Invalid request.")
+              : null;
+        const message =
+          errorBlock?.message ||
+          (typeof data?.error === "string" ? data.error : null) ||
+          detail ||
+          (typeof data?.message === "string" ? data.message : null) ||
+          `Pipeline request failed (HTTP ${res.status}).`;
+        setValidationError(message);
+        setPipelineState(null);
+        return;
+      }
+      setValidationError(null);
       setPipelineState(data);
-    } catch (err: any) {
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
+      console.error("Pipeline request error:", err);
       setValidationError("Failed to communicate with pipeline server.");
     } finally {
+      controller.abort();
       setLoading(false);
     }
   };
 
-  const hasSpill = pipelineState?.has_spill;
-  const geoStats = pipelineState?.geo_stats;
-  const dossier = pipelineState?.dossier;
-  const scenePreviewUrl = inputMode === "upload"
-    ? uploadPreview
-    : selectedScene
-      ? `http://localhost:8000/raw_sar/${selectedScene}`
-      : pipelineState?.target_scene_url || null;
+  const detection = pipelineState?.detection ?? null;
+  const attribution = pipelineState?.attribution ?? null;
+  const topCandidate = attribution?.candidates?.[0] ?? null;
+  const sceneMeta = detection?.scene ?? null;
+  const stats = detection?.statistics ?? null;
+
+  // Exact 3-Way Classification State
+  const rawStatus = pipelineState?.spill_status || detection?.status || "No Oil";
+  const isNoOil = rawStatus === "No Oil" || rawStatus === "No Spill Detected";
+  const isLookalike = rawStatus === "Lookalike" || Boolean(detection?.is_lookalike);
+  const isConfirmed = rawStatus === "Confirmed Spill" || rawStatus === "Confirmed";
+
+  const displayStatus = isNoOil ? "No Oil" : isLookalike ? "Lookalike" : "Confirmed Spill";
+
+  const hasSpill = isConfirmed && (detection?.slicks?.length ?? 0) > 0;
+
+  const geolocatedSlick = (detection?.slicks ?? []).find(
+    (s: any) => s.centroid_lat != null && s.centroid_lon != null
+  );
+
+  const geoStats =
+    detection && (hasSpill || isLookalike)
+      ? {
+          location_name: sceneMeta?.filename ?? selectedScene ?? "SAR scene",
+          centroid_lat: geolocatedSlick?.centroid_lat ?? sceneMeta?.center_lat ?? null,
+          centroid_lon: geolocatedSlick?.centroid_lon ?? sceneMeta?.center_lon ?? null,
+          area_km2: stats?.total_slick_area_km2 ?? 0,
+          bounds: geojsonBounds(detection?.spill_geojson),
+          slick_count: detection?.slicks?.length ?? 0,
+        }
+      : null;
+
+  const dossier = (topCandidate && isConfirmed)
+    ? {
+        vessel_name: topCandidate.vessel_name ?? `MMSI ${topCandidate.mmsi}`,
+        mmsi: topCandidate.mmsi,
+        vessel_type: topCandidate.vessel_type ?? "Commercial",
+        avg_speed_knots: topCandidate.mean_speed_knots != null ? Number(topCandidate.mean_speed_knots).toFixed(1) : "n/a",
+        min_distance_m: Math.round(topCandidate.distance_to_origin_m ?? topCandidate.proximity_m ?? 0),
+        last_seen: topCandidate.last_seen_utc ?? "n/a",
+        score: topCandidate.attribution_score != null ? Math.round(topCandidate.attribution_score) : null,
+      }
+    : null;
+
+  const spillGeoJson = (isConfirmed || isLookalike) ? (detection?.spill_geojson ?? null) : null;
+  const culpritGeoJson =
+    isConfirmed &&
+    attribution?.attribution_geojson &&
+    Object.keys(attribution.attribution_geojson).length > 0
+      ? attribution.attribution_geojson
+      : null;
+
+  const maskPreviewUrl = detection?.mask_preview_png_base64
+    ? `data:image/png;base64,${detection.mask_preview_png_base64}`
+    : null;
+  const scenePreviewUrl = inputMode === "upload" ? uploadPreview : null;
 
   const defaultLocation = { lat: 25.9527, lon: 53.3438, name: "Persian Gulf – Offshore Corridor" };
-  const mapCenter: [number, number] = geoStats
-    ? [Number(geoStats.centroid_lat), Number(geoStats.centroid_lon)]
+  const hasCentroid = geoStats?.centroid_lat != null && geoStats?.centroid_lon != null;
+  const mapCenter: [number, number] = hasCentroid
+    ? [Number(geoStats!.centroid_lat), Number(geoStats!.centroid_lon)]
     : [defaultLocation.lat, defaultLocation.lon];
-  const locationLabel = geoStats
-    ? `${geoStats.location_name || "Persian Gulf"} • ${Number(geoStats.centroid_lat).toFixed(4)}°N, ${Number(geoStats.centroid_lon).toFixed(4)}°E`
-    : `Persian Gulf • ${defaultLocation.lat.toFixed(4)}°N, ${defaultLocation.lon.toFixed(4)}°E`;
+
+  const locationTitle = hasCentroid
+    ? (geoStats!.location_name || "Persian Gulf")
+    : (sceneMeta?.filename || defaultLocation.name);
+
+  const coordinatesSubtitle = hasCentroid
+    ? `${Number(geoStats!.centroid_lat).toFixed(4)}°N, ${Number(geoStats!.centroid_lon).toFixed(4)}°E`
+    : `${defaultLocation.lat.toFixed(4)}°N, ${defaultLocation.lon.toFixed(4)}°E`;
+
+  // Status-dependent tone and accent mapping
+  const getStatusBadgeConfig = () => {
+    if (isNoOil) {
+      return {
+        tone: "text-emerald-400",
+        accent: "bg-emerald-500/10 border-emerald-400/30",
+        icon: CheckCircle2,
+      };
+    }
+    if (isLookalike) {
+      return {
+        tone: "text-amber-400",
+        accent: "bg-amber-500/10 border-amber-400/30",
+        icon: HelpCircle,
+      };
+    }
+    return {
+      tone: "text-rose-400 animate-pulse",
+      accent: "bg-rose-500/10 border-rose-400/30",
+      icon: AlertTriangle,
+    };
+  };
+
+  const statusConfig = getStatusBadgeConfig();
 
   const statCards = [
     {
       label: "Spill Status",
-      value: hasSpill ? "Confirmed" : "Clear",
-      tone: hasSpill ? "text-rose-300" : "text-emerald-300",
-      accent: hasSpill ? "bg-rose-500/10 border-rose-400/30" : "bg-emerald-500/10 border-emerald-400/30",
-      icon: ShieldCheck,
+      value: displayStatus,
+      tone: statusConfig.tone,
+      accent: statusConfig.accent,
+      icon: statusConfig.icon,
     },
     {
       label: "Detected Slicks",
-      value: `${geoStats?.slick_count ?? 0} polygons`,
+      value: `${isNoOil ? 0 : (geoStats?.slick_count ?? 0)} polygons`,
       tone: "text-slate-100",
       accent: "bg-sky-500/10 border-sky-400/30",
       icon: Activity,
@@ -254,9 +371,8 @@ export default function MaritimeDashboard() {
               <div className="rounded-xl border border-indigo-400/30 bg-indigo-500/10 p-2 text-indigo-300">
                 <Satellite className="h-5 w-5" />
               </div>
-              <div>
-                <div className="text-[10px] uppercase tracking-[0.2em] text-indigo-300/80">Mission Control</div>
-                <div className="text-sm font-semibold text-white">SAR Intelligence</div>
+              <div className="text-2xl font-bold tracking-tight text-white">
+                MariScope
               </div>
             </div>
             <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-emerald-300">
@@ -321,7 +437,7 @@ export default function MaritimeDashboard() {
               <div className="relative rounded-2xl border-2 border-dashed border-slate-700 bg-slate-950/80 p-4 text-center transition hover:border-indigo-400/60">
                 <input
                   type="file"
-                  accept=".png,.jpg,.jpeg,.tif,.tiff,image/png,image/jpeg,image/tiff"
+                  accept=".tif,.tiff,image/tiff,image/x-tiff"
                   onChange={async (e) => {
                     const file = e.target.files?.[0] || null;
                     if (!file) {
@@ -332,16 +448,8 @@ export default function MaritimeDashboard() {
                     if (!isValidSarUpload(file)) {
                       setUploadFile(null);
                       setUploadPreview(null);
-                      setPipelineState({
-                        success: false,
-                        validation_msg: "Invalid SAR image: only Sentinel-1 SAR files (.png, .jpg, .jpeg, .tif, .tiff) are accepted.",
-                        has_spill: false,
-                        geo_stats: null,
-                        dossier: null,
-                        spill_geojson: null,
-                        culprit_geojson: null,
-                      });
-                      setValidationError("Invalid SAR image: only Sentinel-1 SAR files (.png, .jpg, .jpeg, .tif, .tiff) are accepted.");
+                      setPipelineState(null);
+                      setValidationError("Invalid SAR image: only GeoTIFF SAR scenes (.tif, .tiff) are accepted.");
                       e.target.value = "";
                       return;
                     }
@@ -350,16 +458,8 @@ export default function MaritimeDashboard() {
                     if (!isRealSar) {
                       setUploadFile(null);
                       setUploadPreview(null);
-                      setPipelineState({
-                        success: false,
-                        validation_msg: "Invalid SAR image: only authentic SAR scenes matching the dataset are accepted.",
-                        has_spill: false,
-                        geo_stats: null,
-                        dossier: null,
-                        spill_geojson: null,
-                        culprit_geojson: null,
-                      });
-                      setValidationError("Invalid SAR image: only authentic SAR scenes matching the dataset are accepted.");
+                      setPipelineState(null);
+                      setValidationError("Invalid SAR image: only authentic GeoTIFF SAR scenes are accepted.");
                       e.target.value = "";
                       return;
                     }
@@ -374,7 +474,7 @@ export default function MaritimeDashboard() {
                   <p className="truncate text-xs font-medium text-slate-200">
                     {uploadFile ? uploadFile.name : "Select SAR scene"}
                   </p>
-                  <span className="mt-1 block text-[10px] text-slate-500">.png, .jpg, .tif accepted</span>
+                  <span className="mt-1 block text-[10px] text-slate-500">GeoTIFF only: .tif, .tiff</span>
                 </div>
               </div>
             )}
@@ -382,13 +482,13 @@ export default function MaritimeDashboard() {
 
           <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-3.5">
             <div className="mb-2 flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-slate-400">
-              <span>Confidence</span>
+              <span>Confidence Threshold</span>
               <span className="font-mono text-indigo-300">{threshold.toFixed(2)}</span>
             </div>
             <input
               type="range"
               min="0.1"
-              max="0.9"
+              max="0.95"
               step="0.05"
               value={threshold}
               onChange={(e) => setThreshold(parseFloat(e.target.value))}
@@ -407,7 +507,7 @@ export default function MaritimeDashboard() {
           ) : (
             <Play className="h-4 w-4 fill-current" />
           )}
-          {loading ? "Analyzing scene" : "Run pipeline"}
+          {loading ? "Analyzing scene..." : "Run pipeline"}
         </button>
       </aside>
 
@@ -419,12 +519,13 @@ export default function MaritimeDashboard() {
               <div className="text-[10px] uppercase tracking-[0.22em] text-indigo-300/80">Maritime Defense Solution</div>
               <h2 className="mt-1 text-lg font-semibold text-white">Sentinel-1 SAR Oil Spill & AIS Culprit Tracking</h2>
               <div className="mt-1.5 inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/70 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
-                <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                {locationLabel}
+                <span className={`h-2 w-2 rounded-full ${isLookalike ? "bg-amber-400" : isConfirmed ? "bg-rose-400" : "bg-emerald-400"}`} />
+                <span>{locationTitle}</span>
+                <span className="text-slate-500">•</span>
+                <span>{coordinatesSubtitle}</span>
               </div>
             </div>
             
-            {/* Header Right Action Items */}
             <div className="flex items-center gap-3">
               <Link
                 href="/alerts"
@@ -465,8 +566,8 @@ export default function MaritimeDashboard() {
 
           <div className="min-h-0 flex-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/40 p-2 shadow-[0_20px_50px_rgba(2,6,23,0.55)] backdrop-blur-sm">
             <SurveillanceMap
-              spillGeoJson={pipelineState?.spill_geojson}
-              culpritGeoJson={pipelineState?.culprit_geojson}
+              spillGeoJson={spillGeoJson}
+              culpritGeoJson={culpritGeoJson}
               showSpill={showSpill}
               showVessel={showVessel}
               center={mapCenter}
@@ -493,47 +594,48 @@ export default function MaritimeDashboard() {
             </div>
           </div>
 
-          {showMask && pipelineState?.mask_url && (
+          {showMask && maskPreviewUrl && (
             <div>
               <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">Segmentation Mask</div>
               <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950">
-                <img src={pipelineState.mask_url} alt="Segmentation Mask" className="h-40 w-full object-cover" />
+                <img src={maskPreviewUrl} alt="Segmentation Mask" className="h-40 w-full object-cover" />
               </div>
             </div>
           )}
 
-          {/* Incident Geo-Location Block with Location Name */}
           <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-3.5">
             <div className="mb-2 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
               <Crosshair className="h-3.5 w-3.5 text-indigo-300" /> Spill Geo-Location
             </div>
-            {geoStats ? (
+            {geoStats && !isNoOil ? (
               <div className="space-y-2 text-xs text-slate-300">
                 <p>
                   <span className="text-slate-500">Location Name:</span>{" "}
                   <strong className="text-white">{geoStats.location_name || "Persian Gulf TSS"}</strong>
                 </p>
                 <p>
-                  <span className="text-slate-500">Centroid:</span> {geoStats.centroid_lat}° N, {geoStats.centroid_lon}° E
+                  <span className="text-slate-500">Centroid:</span>{" "}
+                  {geoStats.centroid_lat != null && geoStats.centroid_lon != null
+                    ? `${Number(geoStats.centroid_lat).toFixed(4)}° N, ${Number(geoStats.centroid_lon).toFixed(4)}° E`
+                    : "not georeferenced (pixel space)"}
                 </p>
-                {geoStats.authority && (
-                  <p>
-                    <span className="text-slate-500">Authority:</span>{" "}
-                    <span className="text-slate-300 font-medium">{geoStats.authority}</span>
-                  </p>
-                )}
                 <p>
                   <span className="text-slate-500">Estimated Area:</span>{" "}
-                  <span className="font-medium text-amber-300">{geoStats.area_km2} km²</span>
+                  <span className="font-medium text-amber-300">{geoStats.area_km2 ?? 0} km²</span>
                 </p>
-                <p className="text-[10px] text-slate-500 pt-1">Footprint: [{geoStats.bounds.join(", ")}]</p>
+                {geoStats.bounds && (
+                  <p className="text-[10px] text-slate-500 pt-1">
+                    Footprint: [{geoStats.bounds.map((b: number) => b.toFixed(3)).join(", ")}]
+                  </p>
+                )}
               </div>
             ) : (
-              <p className="text-xs text-slate-500">No active detections.</p>
+              <p className="text-xs text-slate-500">
+                {isNoOil ? "No slicks identified in scene." : "No active detections."}
+              </p>
             )}
           </div>
 
-          {/* Culprit Dossier */}
           <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-3.5">
             <div className="mb-2 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
               <Ship className="h-3.5 w-3.5 text-cyan-300" /> Culprit Dossier
@@ -545,10 +647,19 @@ export default function MaritimeDashboard() {
                 <div><span className="text-slate-500">Type:</span> {dossier.vessel_type}</div>
                 <div><span className="text-slate-500">Speed:</span> {dossier.avg_speed_knots} knots</div>
                 <div><span className="text-slate-500">Approach:</span> <span className="font-medium text-rose-300">{dossier.min_distance_m} m</span></div>
+                {dossier.score != null && (
+                  <div><span className="text-slate-500">Attribution Score:</span> <span className="font-bold text-emerald-400">{dossier.score}/100</span></div>
+                )}
                 <div><span className="text-slate-500">Last ping:</span> <span className="text-[10px] text-slate-400">{dossier.last_seen}</span></div>
               </div>
             ) : (
-              <p className="text-xs text-slate-500">No vessel correlated yet.</p>
+              <p className="text-xs text-slate-500">
+                {isNoOil
+                  ? "Clean marine scene. Vessel correlation skipped."
+                  : isLookalike
+                  ? "Lookalike detected; vessel attribution suppressed to prevent false accusation."
+                  : "No vessel correlated in spatial-temporal envelope."}
+              </p>
             )}
           </div>
         </div>

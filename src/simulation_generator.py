@@ -1,15 +1,15 @@
-import os
 import json
 import math
+import os
 import random
 import sys
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import yaml
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-from shapely.geometry import Point, Polygon
 from shapely.affinity import scale, translate
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,7 +17,6 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.region_registry import load_regions
-
 
 # ==========================================
 # 1. GEODETIC UTILITIES & CONFIG

@@ -7,7 +7,6 @@ import {
   GeoJSON,
   LayersControl,
   useMap,
-  ScaleControl,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
@@ -34,6 +33,23 @@ const createPulseIcon = (color: string) => {
     iconAnchor: [12, 12],
   });
 };
+
+// Safe control manager to inject scale and handle size recalculations
+function MapControlsManager() {
+  const map = useMap();
+
+  useEffect(() => {
+    map.invalidateSize();
+    const scaleControl = L.control.scale({ position: "bottomleft", imperial: false });
+    scaleControl.addTo(map);
+
+    return () => {
+      scaleControl.remove();
+    };
+  }, [map]);
+
+  return null;
+}
 
 function TacticalMapController({
   center,
@@ -69,6 +85,10 @@ function TacticalMapController({
     } else if (center) {
       map.flyTo(center, 8, { duration: 1.2 });
     }
+
+    return () => {
+      group.clearLayers();
+    };
   }, [center, spillGeoJson, culpritGeoJson, map]);
 
   return null;
@@ -82,8 +102,18 @@ export default function SurveillanceMap({
   center = [26.5, 53.0],
 }: MapProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMounted, setIsMounted] = useState(false);
 
-  const spillStyle = (feature: any) => ({
+  useEffect(() => {
+    setIsMounted(true);
+    return () => setIsMounted(false);
+  }, []);
+
+  if (!isMounted) {
+    return <div className="w-full h-full bg-slate-950 min-h-[550px]" />;
+  }
+
+  const spillStyle = () => ({
     color: "#ff334b",
     weight: 2,
     opacity: 0.9,
@@ -121,7 +151,7 @@ export default function SurveillanceMap({
       },
       mouseout: (e) => {
         const l = e.target;
-        l.setStyle(spillStyle(feature));
+        l.setStyle(spillStyle());
       },
     });
   };
@@ -143,7 +173,7 @@ export default function SurveillanceMap({
     );
   };
 
-  const pointToLayerVessel = (feature: any, latlng: L.LatLng) => {
+  const pointToLayerVessel = (_feature: any, latlng: L.LatLng) => {
     return L.marker(latlng, { icon: createPulseIcon("#00f5d4") });
   };
 
@@ -156,7 +186,7 @@ export default function SurveillanceMap({
     >
       {/* Top HUD Bar */}
       <div className="absolute top-3 left-3 z-[1000] flex items-center gap-2 bg-slate-900/90 backdrop-blur-md px-3.5 py-1.5 rounded-lg border border-slate-700/60 shadow-lg pointer-events-auto">
-        <Compass className="w-4 h-4 text-indigo-400 animate-spin-slow" />
+        <Compass className="w-4 h-4 text-indigo-400 animate-spin" />
         <span className="text-xs font-mono font-semibold tracking-wider text-slate-200">
           GIS PERSIAN GULF TSS
         </span>
@@ -175,6 +205,7 @@ export default function SurveillanceMap({
       </div>
 
       <MapContainer
+        key={`map-${isFullscreen ? "fullscreen" : "inline"}`}
         center={center}
         zoom={8}
         minZoom={4}
@@ -184,11 +215,10 @@ export default function SurveillanceMap({
         attributionControl={false}
         className="w-full h-full"
       >
-        <ScaleControl position="bottomleft" imperial={false} />
+        <MapControlsManager />
 
         {/* Free, Keyless Basemap Layers */}
         <LayersControl position="bottomright">
-          {/* 1. Standard Clean Map */}
           <LayersControl.BaseLayer checked name="OpenStreetMap Standard">
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
@@ -196,7 +226,6 @@ export default function SurveillanceMap({
             />
           </LayersControl.BaseLayer>
 
-          {/* 2. High-Res Satellite */}
           <LayersControl.BaseLayer name="ESRI Satellite Imagery">
             <TileLayer
               attribution="Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
@@ -204,7 +233,6 @@ export default function SurveillanceMap({
             />
           </LayersControl.BaseLayer>
 
-          {/* 3. Tactical Dark Inversion (Zero watermark) */}
           <LayersControl.BaseLayer name="Tactical Night Mode">
             <TileLayer
               className="tactical-dark-tiles"
@@ -246,7 +274,6 @@ export default function SurveillanceMap({
           background-color: #0b0f19 !important;
           font-family: inherit !important;
         }
-        /* Clean hardware-accelerated dark filter for standard tiles */
         .tactical-dark-tiles {
           filter: brightness(0.6) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
         }
@@ -259,9 +286,6 @@ export default function SurveillanceMap({
           padding: 4px 8px !important;
           color: #f8fafc !important;
         }
-        .tactical-tooltip:before {
-          border-top-color: rgba(15, 23, 42, 0.92) !important;
-        }
         .leaflet-control-layers {
           background: rgba(15, 23, 42, 0.92) !important;
           border: 1px solid rgba(51, 65, 85, 0.8) !important;
@@ -269,9 +293,6 @@ export default function SurveillanceMap({
           border-radius: 8px !important;
           font-size: 11px !important;
           backdrop-filter: blur(8px) !important;
-        }
-        .leaflet-control-layers-expanded {
-          padding: 8px 12px !important;
         }
         .leaflet-control-scale-line {
           background: rgba(15, 23, 42, 0.75) !important;

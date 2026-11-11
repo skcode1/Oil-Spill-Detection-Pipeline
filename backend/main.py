@@ -44,7 +44,7 @@ _regions = config.get("regions") or []
 
 RAW_SAR_DIR = paths_cfg.get("test_sar_scene", "data/raw/SAR_training/sentinel/image")
 OUTPUT_DIR = paths_cfg.get("output_dir", "results")
-MODEL_PATH = paths_cfg.get("model_checkpoint", "models/sar_unet_best.pth")
+MODEL_PATH = paths_cfg.get("model_checkpoint", "models/oil_spill_segmentation_model.pth")
 SPILL_PATH = os.path.join(OUTPUT_DIR, "spill_polygon.geojson")
 CULPRIT_PATH = os.path.join(OUTPUT_DIR, "culprit_vessel.geojson")
 LATEST_MASK_PATH = os.path.join(OUTPUT_DIR, "latest_mask.png")

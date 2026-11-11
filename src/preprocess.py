@@ -1,15 +1,17 @@
 
 
-# NOT NECESSARY AS THE DATASET ALREADY CONTAINS PRE-CROPPED 256 X 256 IMAGE CHIPS. 
+# NOT NECESSARY AS THE DATASET ALREADY CONTAINS PRE-CROPPED 256 X 256 IMAGE CHIPS.
 # STILL FOR SAFETY :) BECAUSE MY MIND IS FAAAAHHHH:)
 
 
-import os
 import glob
+import os
+
 import cv2
-import yaml
 import numpy as np
+import yaml
 from PIL import Image
+
 
 def load_config():
     config_path = "config.yaml"
