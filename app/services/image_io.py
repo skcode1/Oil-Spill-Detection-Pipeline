@@ -199,16 +199,16 @@ def scene_from_array(
     arr = np.asarray(array)
 
     # --- shape normalisation (CHW exports are transposed to HWC) ------------
-    if arr.ndim == 3 and arr.shape[0] in (1, 2, 3) and arr.shape[2] not in (1, 2, 3):
+    if arr.ndim == 3 and arr.shape[0] <= 16 and arr.shape[2] > 16:
         arr = np.transpose(arr, (1, 2, 0))
     if arr.ndim not in (2, 3):
         raise UnsupportedImageryError(
             f"Unsupported raster dimensionality {arr.ndim}D (expected 2D or 3D).",
             details={"shape": list(arr.shape)},
         )
-    if arr.ndim == 3 and arr.shape[2] not in (1, 2, 3):
+    if arr.ndim == 3 and arr.shape[2] not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
         raise UnsupportedImageryError(
-            f"Unsupported band count {arr.shape[2]}; expected 1 (VV), 2 (VV+VH) or 3.",
+            f"Unsupported band count {arr.shape[2]}; expected 1 (VV), 2 (VV+VH), 3 (RGB/composite) or 4-13 (optical multi-band).",
             details={"shape": list(arr.shape)},
         )
 
@@ -237,15 +237,13 @@ def scene_from_array(
 
     warnings: List[str] = []
     imagery_kind = "sar"
-    if band_count == 3 and _looks_like_optical(arr):
-        imagery_kind = "unknown"
+    if band_count >= 4 or (band_count == 3 and _looks_like_optical(arr)):
+        imagery_kind = "optical"
         message = (
-            "Scene looks like an optical RGB composite (bands are strongly "
-            "decorrelated). The segmentation model was trained on SAR "
-            "backscatter; results may be unreliable."
+            f"Scene identified as optical/EO imagery ({band_count} bands). "
+            "Spectral index preprocessing (NDWI water masking / FAI algae filtering) "
+            "will be applied."
         )
-        if detection.strict_radiometric_validation:
-            raise UnsupportedImageryError(message)
         warnings.append(message)
 
     return SceneArray(

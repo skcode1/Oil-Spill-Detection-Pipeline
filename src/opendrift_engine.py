@@ -79,9 +79,23 @@ class OpenDriftHindcastEngine:
         reader_wind = reader_netCDF_CF_generic.Reader(self.wind_data_path)
         readers = [reader_curr, reader_wind]
 
-        if self.wave_data_path:
-            reader_wave = reader_netCDF_CF_generic.Reader(self.wave_data_path)
-            readers.append(reader_wave)
+        self.stokes_drift_active = False
+        if self.wave_data_path and (self.wave_data_path.startswith("http") or os.path.exists(self.wave_data_path)):
+            try:
+                logger.info("Wiring WaveWatch III Stokes drift reader: %s", self.wave_data_path)
+                reader_wave = reader_netCDF_CF_generic.Reader(self.wave_data_path)
+                readers.append(reader_wave)
+                o.set_config("drift:stokes_drift", True)
+                self.stokes_drift_active = True
+            except Exception as exc:
+                logger.warning(
+                    "Failed to register Stokes drift reader (%s), falling back cleanly to standard leeway: %s",
+                    self.wave_data_path,
+                    exc,
+                )
+                o.set_config("drift:stokes_drift", False)
+        else:
+            o.set_config("drift:stokes_drift", False)
 
         o.add_readers(readers)
         return o
@@ -243,7 +257,13 @@ class OpenDriftHindcastEngine:
             "drift_bearing_deg": drift_bearing_deg,
             "uncertainty": uncertainty_ellipse,
             "origin_geojson": origin_geojson_path,
-            "simulation_raw_nc": nc_output
+            "simulation_raw_nc": nc_output,
+            "stokes_drift_active": getattr(self, "stokes_drift_active", False),
+            "drift_provenance": (
+                "opendrift_with_wavewatch3_stokes_drift"
+                if getattr(self, "stokes_drift_active", False)
+                else "standard_leeway_fallback (u_current + 0.032 * u_wind)"
+            ),
         }
 
         logger.info(f"Hindcast complete. Origin candidate: ({origin_lat:.5f}, {origin_lon:.5f}) ± "
@@ -353,7 +373,13 @@ class OpenDriftHindcastEngine:
             "forecast_lat": float(np.median(clean_lats)),
             "particles_tracked": len(clean_lons),
             "uncertainty": uncertainty_ellipse,
-            "forecast_end_time": (release_time + timedelta(hours=forecast_hours)).isoformat()
+            "forecast_end_time": (release_time + timedelta(hours=forecast_hours)).isoformat(),
+            "stokes_drift_active": getattr(self, "stokes_drift_active", False),
+            "drift_provenance": (
+                "opendrift_with_wavewatch3_stokes_drift"
+                if getattr(self, "stokes_drift_active", False)
+                else "standard_leeway_fallback (u_current + 0.032 * u_wind)"
+            ),
         }
 
         logger.info(f"Forecast complete. Slick centroid approx ({np.median(clean_lats):.5f}, {np.median(clean_lons):.5f})")

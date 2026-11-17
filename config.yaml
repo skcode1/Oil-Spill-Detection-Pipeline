@@ -20,7 +20,11 @@ model:
   encoder: "resnet34"
   encoder_weights: "imagenet"
   in_channels: 3                    # [VV, VH, VV/VH ratio] — model expects 3-channel SAR composite
-  classes: 3                        # Checkpoint provides 3 classes: 0 Background, 1 Oil Spill, 2 Look-Alike
+  # Checkpoint taxonomy compatibility:
+  # - 3-class standard (default): classes: 3, class_names: ["background", "oil_spill", "look_alike"]
+  # - 5-class Krestenitis SAR:    classes: 5, class_names: ["sea", "oil_spill", "look_alike", "ship", "land"]
+  # DetectionService dynamically detects head channels and vectorizes class-3 ships when 5-class is active.
+  classes: 3
   class_names: ["background", "oil_spill", "look_alike"]
   oil_class_index: 1
   lookalike_class_index: 2
@@ -247,7 +251,7 @@ training:
     focal_weight: 1.0
     focal_gamma: 2.0
 
-# SAR scene radiometric validation thresholds (backend/main.py).
+# SAR scene radiometric validation thresholds (app/services/image_io.py).
 validation:
   min_dim: 32
   max_dim: 512
@@ -257,7 +261,7 @@ validation:
   std_tolerance: 45.0
   reference_stats: {mean: 85.0, std: 28.0}
 
-# FastAPI backend (backend/main.py).
+# FastAPI backend (app/main.py).
 backend:
   base_url: "http://localhost:8000"
   python_executable: null    # defaults to sys.executable

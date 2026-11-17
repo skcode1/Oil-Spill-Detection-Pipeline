@@ -243,8 +243,9 @@ class TrafficBundle:
 class AttributionService:
     """Prune AIS traffic against the drift envelope and rank suspect vessels."""
 
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, stream_adapter: Optional[Any] = None) -> None:
         self.settings = settings
+        self.stream_adapter = stream_adapter
 
     def prune(self, request: PruneRequest) -> PruneResponse:
         geometry = self._geometry(
@@ -409,8 +410,19 @@ class AttributionService:
             return path, path.name, None
         records = list(ais_records or [])
         if not records:
+            if self.stream_adapter is not None:
+                stream_df = self.stream_adapter.get_dataframe()
+                if not stream_df.empty:
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    self.settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+                    temp_dir = Path(
+                        tempfile.mkdtemp(prefix=f"ais_stream_{stamp}_", dir=self.settings.artifact_dir)
+                    )
+                    csv_path = temp_dir / "ais_stream_records.csv"
+                    stream_df.to_csv(csv_path, index=False)
+                    return csv_path, f"stream:{len(stream_df)} live pings buffered", temp_dir
             raise InvalidInputError(
-                "an AIS source is required: supply ais_csv_path or ais_records"
+                "an AIS source is required: supply ais_csv_path, ais_records, or buffer an active stream"
             )
         frame = pd.json_normalize(records)
         missing = sorted({"mmsi", "timestamp", "lon", "lat"} - set(frame.columns))

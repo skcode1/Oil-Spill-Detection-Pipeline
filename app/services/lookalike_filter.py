@@ -88,6 +88,12 @@ class LookalikeFilterSettings(BaseModel):
         description="Enable lookalike dataset path detection (check for 'lookalike' in path).",
     )
 
+    # Optical spectral index heuristics (biogenic algal bloom detection)
+    min_algal_bloom_fai: float = Field(
+        default=0.03,
+        description="Floating Algae Index (FAI) threshold above which surface features are flagged as biogenic algal blooms.",
+    )
+
     # Overall sensitivity
     heuristic_threshold_count: int = Field(
         default=3,
@@ -260,7 +266,7 @@ def _analyze_spatial_coherence(
     if slicks:
         slick = slicks[0]
         area_px = slick.get("area_px", 0)
-        if "geometry" in slick:
+        if slick.get("geometry") and isinstance(slick["geometry"], dict):
             try:
                 coords = slick["geometry"].get("coordinates", [[[]]])[0]
                 if coords:
@@ -359,6 +365,55 @@ def _detect_lookalike_dataset_path(
     return indicators, scores
 
 
+def compute_fai(
+    red: np.ndarray,
+    nir: np.ndarray,
+    swir1: np.ndarray,
+    lambda_red: float = 665.0,
+    lambda_nir: float = 842.0,
+    lambda_swir1: float = 1610.0,
+) -> np.ndarray:
+    """Compute the Floating Algae Index (FAI, Hu 2009).
+
+    FAI = NIR - (Red + (SWIR1 - Red) * ((lambda_NIR - lambda_Red) / (lambda_SWIR1 - lambda_Red)))
+    """
+    scale = (lambda_nir - lambda_red) / max(lambda_swir1 - lambda_red, 1e-6)
+    baseline = red + (swir1 - red) * scale
+    return nir - baseline
+
+
+def compute_ndwi(green: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    """Compute Normalized Difference Water Index (NDWI, McFeeters 1996).
+
+    NDWI = (Green - NIR) / (Green + NIR)
+    """
+    denominator = green + nir
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndwi = np.where(denominator > 1e-6, (green - nir) / denominator, 0.0)
+    return np.nan_to_num(ndwi, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _analyze_optical_fai(
+    fai_value: Optional[float],
+    settings: LookalikeFilterSettings,
+) -> Tuple[List[str], Dict[str, float]]:
+    """Flag biogenic algal blooms when Floating Algae Index is elevated."""
+    indicators: List[str] = []
+    scores: Dict[str, float] = {}
+    if fai_value is None or not np.isfinite(fai_value):
+        scores["algal_bloom_fai"] = 0.0
+        return indicators, scores
+
+    if fai_value >= settings.min_algal_bloom_fai:
+        indicators.append("algal_bloom_fai")
+        scores["algal_bloom_fai"] = min(
+            1.0, float(fai_value / max(settings.min_algal_bloom_fai * 2.0, 1e-6))
+        )
+    else:
+        scores["algal_bloom_fai"] = 0.0
+    return indicators, scores
+
+
 # --------------------------------------------------------------------------- #
 #  Main Classification Engine
 # --------------------------------------------------------------------------- #
@@ -378,6 +433,7 @@ class LookalikeFilter:
         scene_pixels: int,
         scene_path: Optional[str] = None,
         mean_confidence: float = 0.0,
+        fai_mean: Optional[float] = None,
     ) -> LookalikeClassification:
         """Classify a detection result as Confirmed/Lookalike/Unverified."""
         all_indicators: List[str] = []
@@ -406,6 +462,10 @@ class LookalikeFilter:
         path_indicators, path_scores = _detect_lookalike_dataset_path(scene_path, self.settings)
         all_indicators.extend(path_indicators)
         all_scores.update(path_scores)
+
+        fai_indicators, fai_scores = _analyze_optical_fai(fai_mean, self.settings)
+        all_indicators.extend(fai_indicators)
+        all_scores.update(fai_scores)
 
         num_indicators = len(all_indicators)
         is_lookalike = num_indicators >= self.settings.heuristic_threshold_count

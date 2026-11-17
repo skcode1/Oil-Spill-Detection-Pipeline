@@ -278,7 +278,7 @@ class LookalikeFilterSettings:
 
     # Confidence scoring
     min_confident_scene_pixels: int = 50_000
-    max_confirmed_oil_coverage_fraction: float = 0.85
+    max_confirmed_oil_coverage_fraction: float = 0.50
 
     # Metadata context
     detect_lookalike_dataset_paths: bool = True

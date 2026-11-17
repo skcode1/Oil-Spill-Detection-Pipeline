@@ -281,16 +281,22 @@ def build_model(model_cfg: Dict[str, Any]) -> nn.Module:
 # --------------------------------------------------------------------------- #
 def _save_checkpoint(model: nn.Module, model_cfg: Dict[str, Any], path: str) -> None:
     """Persist model weights with architecture metadata inside the .pt."""
+    n_cls = int(model_cfg.get("num_classes", model_cfg.get("classes", NUM_CLASSES)))
+    default_names = (
+        ["background", "oil_spill", "look_alike"]
+        if n_cls == 3
+        else [CLASS_NAMES.get(i, f"class_{i}") for i in range(n_cls)]
+    )
     checkpoint = {
         "model_state_dict": model.state_dict(),
-        "num_classes": int(model_cfg.get("classes", NUM_CLASSES)),
-        "class_names": list(model_cfg.get("class_names", [CLASS_NAMES[i] for i in range(NUM_CLASSES)])),
+        "num_classes": n_cls,
+        "class_names": list(model_cfg.get("class_names", default_names)),
         "architecture": model_cfg.get("architecture", "deeplabv3plus"),
         "encoder": model_cfg.get("encoder", "resnet34"),
         "in_channels": int(model_cfg.get("in_channels", 3)),
     }
     torch.save(checkpoint, path)
-    print(f"--> Saved checkpoint (with metadata) to {path}")
+    print(f"--> Saved checkpoint ({n_cls}-class with metadata) to {path}")
 
 
 # --------------------------------------------------------------------------- #

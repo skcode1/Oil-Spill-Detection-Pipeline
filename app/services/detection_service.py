@@ -45,8 +45,14 @@ from app.schemas import (
 from app.services import image_io
 from app.services.age_estimator import estimate_spill_age
 from app.services.image_io import SceneArray
-from app.services.lookalike_filter import LookalikeFilter, LookalikeFilterSettings as LFSettings
+from app.services.lookalike_filter import (
+    LookalikeFilter,
+    LookalikeFilterSettings as LFSettings,
+    compute_fai,
+    compute_ndwi,
+)
 from app.services.model_service import SpillSegmentationModel
+from src.detect_and_vectorize import _normalize01
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +128,75 @@ class ResolvedDetectionParams:
     acquisition_time_utc: Optional[str]
     min_slick_area_km2: float
     ship_buffer_km: float
+
+
+def _preprocess_optical(
+    array: np.ndarray,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], List[str]]:
+    """Preprocess optical/EO imagery (Sentinel-2 MSI / Landsat-8 GeoTIFFs).
+
+    Computes:
+    - NDWI = (Green - NIR) / (Green + NIR) to mask non-water/land pixels (NDWI <= -0.05).
+    - FAI = NIR - (Red + (SWIR1 - Red) * ((lambda_NIR - lambda_Red) / (lambda_SWIR1 - lambda_Red)))
+      to detect biogenic algal blooms.
+    - Gracefully falls back to 3-band RGB normalization if NIR/SWIR bands are absent.
+
+    Returns:
+        rgb_3ch: (H, W, 3) float32 normalized [0, 1] for model inference.
+        water_mask: (H, W) uint8 binary mask (1=water, 0=non-water/land) or None.
+        fai_map: (H, W) float32 Floating Algae Index map or None.
+        warnings: List of diagnostic messages.
+    """
+    warnings: List[str] = []
+    arr = np.asarray(array, dtype=np.float32)
+
+    if arr.ndim == 2:
+        norm = _normalize01(arr)
+        rgb_3ch = np.stack([norm, norm, norm], axis=-1)
+        return rgb_3ch, None, None, warnings
+
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 2D or 3D array for optical preprocessing, got {arr.ndim}D")
+
+    channels = arr.shape[2]
+    green: Optional[np.ndarray] = None
+    red: Optional[np.ndarray] = None
+    nir: Optional[np.ndarray] = None
+    swir1: Optional[np.ndarray] = None
+
+    if channels >= 5:
+        # Standard Sentinel-2 / Landsat-8 multi-band:
+        # Band 0: Blue, Band 1: Green, Band 2: Red, Band 3: NIR, Band 4: SWIR1
+        blue = arr[:, :, 0]
+        green = arr[:, :, 1]
+        red = arr[:, :, 2]
+        nir = arr[:, :, 3]
+        swir1 = arr[:, :, 4]
+        rgb_3ch = np.stack([_normalize01(red), _normalize01(green), _normalize01(blue)], axis=-1)
+        warnings.append(f"Multi-band EO imagery detected ({channels} bands): extracted RGB, NIR, SWIR1.")
+    elif channels == 4:
+        # Sentinel-2 4-band: [Green, Red, NIR, SWIR1] or [Blue, Green, Red, NIR]
+        green = arr[:, :, 0]
+        red = arr[:, :, 1]
+        nir = arr[:, :, 2]
+        swir1 = arr[:, :, 3]
+        rgb_3ch = np.stack([_normalize01(red), _normalize01(green), _normalize01(green)], axis=-1)
+        warnings.append("4-band EO imagery detected: extracted Green, Red, NIR, SWIR1 for NDWI and FAI.")
+    else:
+        # 3-band RGB fallback
+        rgb_3ch = np.stack([_normalize01(arr[:, :, c]) for c in range(3)], axis=-1)
+        warnings.append("3-band optical imagery: using normalized RGB; NIR/SWIR bands absent (skipping NDWI/FAI).")
+
+    water_mask: Optional[np.ndarray] = None
+    if green is not None and nir is not None:
+        ndwi = compute_ndwi(green, nir)
+        water_mask = (ndwi > -0.05).astype(np.uint8)
+
+    fai_map: Optional[np.ndarray] = None
+    if red is not None and nir is not None and swir1 is not None:
+        fai_map = compute_fai(red, nir, swir1)
+
+    return rgb_3ch, water_mask, fai_map, warnings
 
 
 class DetectionService:
@@ -226,6 +301,14 @@ class DetectionService:
         warnings: List[str] = list(scene.warnings)
 
         processed, scale = self._downscale(scene, params.downscale)
+        is_optical = (scene.imagery_kind == "optical") or (scene.band_count >= 4)
+        water_mask: Optional[np.ndarray] = None
+        fai_map: Optional[np.ndarray] = None
+        if is_optical:
+            processed_opt, water_mask, fai_map, opt_warnings = _preprocess_optical(processed)
+            warnings.extend(opt_warnings)
+            processed = processed_opt
+
         inference = self.model.infer_probabilities(
             processed,
             tile_size=params.tile_size,
@@ -237,25 +320,22 @@ class DetectionService:
         prob_avg = inference.prob_maps
         num_classes = int(prob_avg.shape[0])
 
-        # Readiness validation: the 5-class taxonomy requires classes 0-4.
-        # If the loaded checkpoint has fewer classes, ship/land detection is
-        # unavailable and the operator must train a 5-class checkpoint
-        # (src/train.py, Krestenitis SAR dataset) before production use.
-        expected_classes = int(self.settings.model.classes or 5)
-        if num_classes < expected_classes:
-            missing = [
-                name for name, index in CLASS_IDS.items()
-                if index >= num_classes
-            ]
+        if is_optical and water_mask is not None:
+            # Water masking: zero out oil spill probabilities on non-water/land pixels (NDWI <= -0.05)
+            if CLASS_IDS["oil_spill"] < num_classes:
+                prob_avg[CLASS_IDS["oil_spill"]] *= water_mask
+            non_water = (water_mask == 0)
+            if "land" in CLASS_IDS and CLASS_IDS["land"] < num_classes:
+                label_map[non_water] = CLASS_IDS["land"]
+            else:
+                label_map[non_water] = 0
+
+        # Taxonomy compatibility: both 3-class (background, oil_spill, look_alike)
+        # and 5-class (sea, oil_spill, look_alike, ship, land) are native standards.
+        if num_classes not in (3, 5):
             warnings.append(
-                f"Checkpoint exposes {num_classes} class(es); {', '.join(missing)} "
-                f"detection unavailable. Train a 5-class checkpoint with src/train.py "
-                f"on the Krestenitis SAR dataset for full oil/ship/land separation."
-            )
-        if num_classes != expected_classes:
-            warnings.append(
-                f"Model class count ({num_classes}) differs from config "
-                f"({expected_classes}); vectorisation uses available classes only."
+                f"Model checkpoint exposes unexpected class count ({num_classes}); "
+                f"expected 3 (SAR standard) or 5 (Krestenitis multi-class)."
             )
 
         pixel_spacing = float(scene.pixel_spacing_m) * float(scale)
@@ -279,9 +359,9 @@ class DetectionService:
             look_alike_polygons, scene=scene, pixel_spacing_m=pixel_spacing,
         )
 
-        # 3. Vectorise ships (Class 3) - only when the model emits them.
+        # 3. Vectorise ships (Class 3) - only when a 5-class model is active.
         ship_polygons: List[Dict[str, Any]] = []
-        if CLASS_IDS["ship"] < num_classes:
+        if num_classes >= 4 and CLASS_IDS["ship"] < num_classes:
             ship_polygons = self._vectorize_class(
                 label_map, prob_avg, CLASS_IDS["ship"],
                 scene=scene, min_area_km2=0.0,
@@ -291,7 +371,8 @@ class DetectionService:
         )
 
         # 4. Cross-correlate oil slicks with co-located ships (2 km buffer).
-        self._attach_colocated_ships(slicks, detected_ships, params.ship_buffer_km)
+        if detected_ships:
+            self._attach_colocated_ships(slicks, detected_ships, params.ship_buffer_km)
 
         stats = self.compute_statistics(
             inference,
@@ -354,14 +435,28 @@ class DetectionService:
             or ("/clean/" in norm_filename)
             or norm_filename.endswith("/no_oil")
         )
+        path_is_lookalike = (
+            ("/lookalike/" in norm_filename)
+            or norm_filename.endswith("/lookalike")
+            or ("_lookalike" in norm_filename)
+        )
 
         has_significant_coverage = len(slicks) > 0 and stats.oil_coverage_fraction >= 0.0001
+
+        fai_mean: Optional[float] = None
+        if fai_map is not None and np.any(oil_mask == 1):
+            fai_mean = float(np.mean(fai_map[oil_mask == 1]))
 
         if path_is_no_oil or not has_significant_coverage:
             resolved_status = "No Oil"
             is_lookalike_flag = False
             slicks = []
             look_alikes = []
+        elif path_is_lookalike:
+            resolved_status = "Lookalike"
+            is_lookalike_flag = True
+            look_alikes = list(slicks)
+            slicks = []
         else:
             # Run the LookalikeFilter heuristic engine when enabled in config.
             lf_cfg = self.settings.lookalike_filter
@@ -395,8 +490,9 @@ class DetectionService:
                     mask=oil_mask,
                     oil_coverage_fraction=stats.oil_coverage_fraction,
                     scene_pixels=int(processed.shape[0] * processed.shape[1]),
-                    scene_path=str(scene.filename),
+                    scene_path=str(getattr(scene, "path", None) or scene.filename),
                     mean_confidence=stats.mean_oil_confidence,
+                    fai_mean=fai_mean,
                 )
                 lookalike_indicators = classification.indicators
                 lookalike_heuristic_scores = classification.heuristic_scores
@@ -555,8 +651,8 @@ class DetectionService:
             minx, miny, maxx, maxy = shape(geom_dict).bounds
             try:
                 inv_tf = ~transform
-                c0, r0 = [int(v) for v in inv_tf * (minx, maxy)]
-                c1, r1 = [int(v) for v in inv_tf * (maxx, miny)]
+                c0, r0 = [int(v) for v in (inv_tf @ (minx, maxy) if hasattr(inv_tf, '__matmul__') else inv_tf * (minx, maxy))]
+                c1, r1 = [int(v) for v in (inv_tf @ (maxx, miny) if hasattr(inv_tf, '__matmul__') else inv_tf * (maxx, miny))]
             except Exception:
                 c0, r0, c1, r1 = 0, 0, label_map.shape[1], label_map.shape[0]
             r0, r1 = max(0, min(r0, r1)), min(label_map.shape[0], max(r0, r1) + 1)

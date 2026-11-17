@@ -101,7 +101,15 @@ POINT_SEED_BUFFER_DEG = 0.01
 #: :meth:`MetoceanField.from_environment_json`); anything else in the file
 #: (hindcast windows, origin estimates, provenance notes) is ignored.
 SAMPLE_KEYS = frozenset(
-    {"timestamp_utc", "u_current_mps", "v_current_mps", "u_wind_mps", "v_wind_mps"}
+    {
+        "timestamp_utc",
+        "u_current_mps",
+        "v_current_mps",
+        "u_wind_mps",
+        "v_wind_mps",
+        "u_stokes_mps",
+        "v_stokes_mps",
+    }
 )
 
 #: Timestamp aliases accepted in a metocean manifest.
@@ -127,20 +135,33 @@ class MetoceanField:
     v_current: np.ndarray
     u_wind: np.ndarray
     v_wind: np.ndarray
+    u_stokes: Optional[np.ndarray] = None
+    v_stokes: Optional[np.ndarray] = None
     source: str = "config_fallback"
     #: Wind drift factor carried by the source (``None`` = config/request value).
     wind_drift_factor: Optional[float] = None
+    wave_provenance: str = "standard_leeway_fallback (u_current + 0.032 * u_wind)"
 
     @classmethod
     def uniform(cls, sample: Dict[str, float], source: str = "config_fallback") -> "MetoceanField":
         """Time-invariant field built from a single u/v sample (config defaults)."""
+        u_s = float(sample.get("u_stokes_mps", 0.0) or 0.0)
+        v_s = float(sample.get("v_stokes_mps", 0.0) or 0.0)
+        has_stokes = (u_s != 0.0 or v_s != 0.0)
         return cls(
             times=[datetime(1970, 1, 1, tzinfo=timezone.utc)],
             u_current=np.array([float(sample["u_current_mps"])]),
             v_current=np.array([float(sample["v_current_mps"])]),
             u_wind=np.array([float(sample["u_wind_mps"])]),
             v_wind=np.array([float(sample["v_wind_mps"])]),
+            u_stokes=np.array([u_s]),
+            v_stokes=np.array([v_s]),
             source=source,
+            wave_provenance=(
+                "wavewatch3_stokes_drift"
+                if has_stokes
+                else "standard_leeway_fallback (u_current + 0.032 * u_wind)"
+            ),
         )
 
     @classmethod
@@ -158,13 +179,29 @@ class MetoceanField:
             else:
                 times.append(default_time)
         order = np.argsort(np.array([moment.timestamp() for moment in times]), kind="stable")
+        u_stokes = np.array(
+            [float(getattr(samples[int(i)], "u_stokes_mps", 0.0) or 0.0) for i in order],
+            dtype=float,
+        )
+        v_stokes = np.array(
+            [float(getattr(samples[int(i)], "v_stokes_mps", 0.0) or 0.0) for i in order],
+            dtype=float,
+        )
+        has_stokes = bool(np.any(u_stokes != 0.0) or np.any(v_stokes != 0.0))
         return cls(
             times=[times[int(index)] for index in order],
             u_current=np.array([samples[int(i)].u_current_mps for i in order], dtype=float),
             v_current=np.array([samples[int(i)].v_current_mps for i in order], dtype=float),
             u_wind=np.array([samples[int(i)].u_wind_mps for i in order], dtype=float),
             v_wind=np.array([samples[int(i)].v_wind_mps for i in order], dtype=float),
+            u_stokes=u_stokes,
+            v_stokes=v_stokes,
             source=source,
+            wave_provenance=(
+                "wavewatch3_stokes_drift"
+                if has_stokes
+                else "standard_leeway_fallback (u_current + 0.032 * u_wind)"
+            ),
         )
 
     @classmethod
@@ -237,6 +274,8 @@ class MetoceanField:
         wind_drift_factor = None if factor is None else float(factor)
         field = cls.from_samples(samples, default_time=default_time, source=source)
         field.wind_drift_factor = wind_drift_factor
+        if "wave_provenance" in payload:
+            field.wave_provenance = str(payload["wave_provenance"])
         return field
 
     @property
@@ -275,6 +314,31 @@ class MetoceanField:
             blend(self.u_wind),
             blend(self.v_wind),
         )
+
+    def at_with_stokes(self, moment: datetime) -> Tuple[float, float, float, float, float, float]:
+        """Interpolated ``(u_current, v_current, u_wind, v_wind, u_stokes, v_stokes)``."""
+        u_c, v_c, u_w, v_w = self.at(moment)
+        if len(self.times) == 1:
+            u_s = float(self.u_stokes[0]) if (self.u_stokes is not None and len(self.u_stokes) > 0) else 0.0
+            v_s = float(self.v_stokes[0]) if (self.v_stokes is not None and len(self.v_stokes) > 0) else 0.0
+            return u_c, v_c, u_w, v_w, u_s, v_s
+        stamps = np.array([instant.timestamp() for instant in self.times])
+        target = as_utc(moment).timestamp()
+        if target <= stamps[0]:
+            index, weight = 0, 0.0
+        elif target >= stamps[-1]:
+            index, weight = len(stamps) - 2, 1.0
+        else:
+            index = int(np.searchsorted(stamps, target, side="right") - 1)
+            span = stamps[index + 1] - stamps[index]
+            weight = 0.0 if span <= 0 else (target - stamps[index]) / span
+
+        def blend_stokes(values: Optional[np.ndarray]) -> float:
+            if values is None or len(values) <= index + 1:
+                return 0.0
+            return float(values[index] + weight * (values[index + 1] - values[index]))
+
+        return u_c, v_c, u_w, v_w, blend_stokes(self.u_stokes), blend_stokes(self.v_stokes)
 
 
 def _circle_polygon(center_lon: float, center_lat: float, radius_m: float, vertices: int = 48):
@@ -447,9 +511,9 @@ class LagrangianDriftEngine:
 
         for step in range(1, steps + 1):
             moment = start_time + timedelta(seconds=sign * step * dt)
-            u_current, v_current, u_wind, v_wind = field.at(moment)
-            east = u_current + wind_drift_factor * u_wind
-            north = v_current + wind_drift_factor * v_wind
+            u_current, v_current, u_wind, v_wind, u_stokes, v_stokes = field.at_with_stokes(moment)
+            east = u_current + wind_drift_factor * u_wind + u_stokes
+            north = v_current + wind_drift_factor * v_wind + v_stokes
             velocities.append(float(math.hypot(east, north)))
 
             count = int(lons.size)
@@ -902,6 +966,7 @@ class DriftService:
             ),
             uncertainty=_ellipse_from_fit(fit, confidence),
             warnings=warnings,
+            wave_provenance=field.wave_provenance,
         )
 
     def _run_opendrift(
@@ -927,6 +992,7 @@ class DriftService:
         overrides = metocean_paths or {}
         current_nc = overrides.get("current_nc") or request.current_nc
         wind_nc = overrides.get("wind_nc") or request.wind_nc
+        wave_nc = overrides.get("wave_nc") or request.wave_nc
 
         seed_path, seed_lon, seed_lat = self._write_seed_geojson(request)
         output_dir = self.settings.artifact_dir / "opendrift"
@@ -936,7 +1002,7 @@ class DriftService:
                 current_data_path=str(self._resolve_data_path(str(current_nc))),
                 wind_data_path=str(self._resolve_data_path(str(wind_nc))),
                 wave_data_path=(
-                    str(self._resolve_data_path(request.wave_nc)) if request.wave_nc else None
+                    str(self._resolve_data_path(str(wave_nc))) if wave_nc else None
                 ),
                 oil_type=request.oil_type or self.settings.metocean.oil_type,
                 horizontal_diffusivity=diffusivity,
@@ -1042,6 +1108,12 @@ class DriftService:
             envelope_geojson=envelope,
             uncertainty=_ellipse_from_fit(fit, confidence),
             warnings=warnings,
+            wave_provenance=str(
+                summary.get(
+                    "drift_provenance",
+                    "standard_leeway_fallback (u_current + 0.032 * u_wind)",
+                )
+            ),
         )
 
     def _write_seed_geojson(self, request: DriftRequest) -> Tuple[Optional[Path], float, float]:

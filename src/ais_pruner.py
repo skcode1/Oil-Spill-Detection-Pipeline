@@ -37,15 +37,19 @@ source column forwarded unchanged):
 from __future__ import annotations
 
 import bz2
+import collections
 import csv
 import gc
 import gzip
+import json
 import logging
 import lzma
 import os
 import re
+import socket
+import threading
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -61,12 +65,15 @@ __all__ = [
     "AISPrunerConfig",
     "AISPrunerError",
     "AISSchemaError",
+    "AISStreamAdapter",
     "DEFAULT_SCHEMA_ALIASES",
     "REQUIRED_AIS_FIELDS",
     "build_aeqd_crs",
     "compute_geodesic_bounding_box",
+    "decode_nmea_ais_sentence",
     "generate_error_ellipse_polygon",
     "prune_ais_stream",
+    "prune_dataframe",
     "prune_marinecadastre_ais",
     "resolve_ais_schema",
     "sniff_delimiter",
@@ -874,3 +881,447 @@ def prune_marinecadastre_ais(
         temporal_window_hours=temporal_window_hours,
         chunksize=chunksize,
     )
+
+
+def prune_dataframe(
+    df: pd.DataFrame,
+    origin_lon: float,
+    origin_lat: float,
+    t0_time_str: Union[str, datetime, pd.Timestamp],
+    semi_major_m: float,
+    semi_minor_m: float,
+    orientation_deg: float,
+    temporal_window_hours: Optional[float] = None,
+    config: Optional[AISPrunerConfig] = None,
+    window_before_hours: Optional[float] = None,
+    window_after_hours: Optional[float] = None,
+    schema_aliases: Optional[Mapping[str, Sequence[str]]] = None,
+    sort_by: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Filter an in-memory AIS DataFrame against an elliptical uncertainty envelope.
+
+    Applies the same three-stage cascade (temporal windowing, geodesic coarse
+    envelope, and fine AEQD elliptical containment) as :func:`prune_ais_stream`.
+    """
+    if df.empty:
+        return _empty_result_frame()
+
+    effective = config or AISPrunerConfig()
+    t0 = _parse_t0(t0_time_str)
+
+    if temporal_window_hours is not None:
+        if window_before_hours is not None or window_after_hours is not None:
+            raise AISPrunerError(
+                "Specify either temporal_window_hours or the explicit "
+                "(window_before_hours, window_after_hours) pair, not both."
+            )
+        window_before = float(temporal_window_hours)
+        window_after = float(temporal_window_hours)
+    elif window_before_hours is not None or window_after_hours is not None:
+        window_before = float(0.0 if window_before_hours is None else window_before_hours)
+        window_after = float(0.0 if window_after_hours is None else window_after_hours)
+    else:
+        window_before = float(effective.window_before_hours)
+        window_after = float(effective.window_after_hours)
+
+    t_min = t0 - pd.Timedelta(hours=window_before)
+    t_max = t0 + pd.Timedelta(hours=window_after)
+
+    merged_aliases = dict(effective.schema_aliases or {})
+    if schema_aliases:
+        merged_aliases.update(schema_aliases)
+
+    header = [str(column) for column in df.columns]
+    column_map = resolve_ais_schema(header, aliases=merged_aliases or None)
+    rename_map = {
+        column_map[canonical]: canonical for canonical in REQUIRED_AIS_FIELDS if canonical in column_map
+    }
+    chunk = df.rename(columns=rename_map)
+
+    # Stage 1: Vectorized temporal window filter
+    ping_ts = _parse_ping_timestamps(chunk["timestamp"], effective)
+    time_mask = (ping_ts >= t_min) & (ping_ts <= t_max)
+    if not time_mask.any():
+        return _empty_result_frame()
+    windowed = chunk.assign(timestamp=ping_ts).loc[time_mask]
+
+    # Stage 2: Geodesic coarse envelope
+    max_radius = max(semi_major_m, semi_minor_m)
+    lon_min, lat_min, lon_max, lat_max = compute_geodesic_bounding_box(
+        origin_lat,
+        origin_lon,
+        max_radius,
+        margin_fraction=effective.bounding_box_margin_fraction,
+    )
+    lon_values = pd.to_numeric(windowed["lon"], errors="coerce").to_numpy(dtype="float64")
+    lat_values = pd.to_numeric(windowed["lat"], errors="coerce").to_numpy(dtype="float64")
+    if effective.normalize_longitude:
+        lon_values = unwrap_longitude_deg(lon_values)
+    lon_unwrapped = unwrap_around_anchor(lon_values, origin_lon)
+    finite_coords = np.isfinite(lon_values) & np.isfinite(lat_values)
+    spatial_mask = (
+        finite_coords
+        & (lat_values >= lat_min)
+        & (lat_values <= lat_max)
+        & (lon_unwrapped >= lon_min)
+        & (lon_unwrapped <= lon_max)
+    )
+    if not spatial_mask.any():
+        return _empty_result_frame()
+    candidates = windowed.loc[spatial_mask]
+
+    # Optional MMSI hygiene
+    mmsi_values = pd.to_numeric(candidates["mmsi"], errors="coerce").to_numpy(dtype="float64")
+    invalid_mmsi = (
+        ~np.isfinite(mmsi_values)
+        | (mmsi_values < MMSI_MIN)
+        | (mmsi_values > MMSI_MAX)
+    )
+    if effective.drop_invalid_mmsi and invalid_mmsi.any():
+        candidates = candidates.iloc[np.flatnonzero(~invalid_mmsi)]
+        if candidates.empty:
+            return _empty_result_frame()
+
+    # Stage 3: Fine containment in AEQD metric plane
+    aeqd_crs = build_aeqd_crs(origin_lat, origin_lon, datum=effective.datum)
+    uncertainty_polygon = generate_error_ellipse_polygon(
+        origin_lon,
+        origin_lat,
+        semi_major_m,
+        semi_minor_m,
+        orientation_deg,
+        resolution=effective.ellipse_resolution,
+    )
+    to_metric = pyproj.Transformer.from_crs("EPSG:4326", aeqd_crs, always_xy=True)
+    containment = shapely.covers if effective.boundary_inclusive else shapely.within
+
+    cand_lon = pd.to_numeric(candidates["lon"], errors="coerce").to_numpy(dtype="float64")
+    cand_lat = pd.to_numeric(candidates["lat"], errors="coerce").to_numpy(dtype="float64")
+    if effective.normalize_longitude:
+        cand_lon = unwrap_longitude_deg(cand_lon)
+    x_m, y_m = to_metric.transform(cand_lon, cand_lat)
+    inside_flags = np.asarray(
+        containment(uncertainty_polygon, shapely.points(x_m, y_m)),
+        dtype=bool,
+    )
+    inside_positions = np.flatnonzero(inside_flags)
+    if inside_positions.size == 0:
+        return _empty_result_frame()
+
+    selected = candidates.iloc[inside_positions].copy()
+    selected["distance_to_origin_m"] = np.round(
+        np.hypot(
+            np.asarray(x_m)[inside_positions],
+            np.asarray(y_m)[inside_positions],
+        ),
+        effective.rounding_decimals,
+    )
+    selected["temporal_offset_min"] = np.round(
+        ((selected["timestamp"] - t0).dt.total_seconds() / 60.0).to_numpy(
+            dtype="float64"
+        ),
+        effective.temporal_rounding_decimals,
+    )
+
+    if effective.drop_duplicate_pings:
+        selected = selected.drop_duplicates(
+            subset=[col for col in REQUIRED_AIS_FIELDS if col in selected.columns], keep="first"
+        )
+        if selected.empty:
+            return _empty_result_frame()
+
+    default_sorting: Tuple[str, ...] = ("distance_to_origin_m", "timestamp")
+    ordering = [
+        column
+        for column in (tuple(sort_by) if sort_by else default_sorting)
+        if column in selected.columns
+    ]
+    if ordering:
+        selected = selected.sort_values(
+            by=ordering, ascending=[True] * len(ordering), kind="stable"
+        ).reset_index(drop=True)
+
+    return selected
+
+
+def decode_nmea_ais_sentence(
+    sentence: str,
+    timestamp: Optional[Union[datetime, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Decode NMEA 0183 !AIVDM/!AIVDO or JSON sentence into a vessel position record.
+
+    Uses a fast 6-bit armored ASCII bit-unpacking algorithm (fallback for pyais).
+    """
+    sentence = sentence.strip()
+    if not sentence:
+        return None
+
+    # JSON line support
+    if sentence.startswith("{") and sentence.endswith("}"):
+        try:
+            data = json.loads(sentence)
+            if "mmsi" in data and ("lat" in data or "latitude" in data) and ("lon" in data or "longitude" in data):
+                ts = data.get("timestamp") or (
+                    timestamp.isoformat() if isinstance(timestamp, datetime) else str(timestamp)
+                ) if timestamp else datetime.now(timezone.utc).isoformat()
+                return {
+                    "mmsi": int(data["mmsi"]),
+                    "timestamp": str(ts),
+                    "lon": float(data.get("lon", data.get("longitude"))),
+                    "lat": float(data.get("lat", data.get("latitude"))),
+                    "sog": float(data.get("sog", data.get("speed", 0.0))),
+                    "cog": float(data.get("cog", data.get("course", 0.0))),
+                }
+        except Exception:
+            return None
+
+    parts = sentence.split(",")
+    if len(parts) < 6 or not parts[0].endswith(("AIVDM", "AIVDO")):
+        return None
+
+    payload = parts[5]
+    bits = ""
+    try:
+        for c in payload:
+            v = ord(c) - 48
+            if v > 40:
+                v -= 8
+            if not 0 <= v <= 63:
+                return None
+            bits += f"{v:06b}"
+    except Exception:
+        return None
+
+    if len(bits) < 38:
+        return None
+
+    msg_type = int(bits[0:6], 2)
+    mmsi = int(bits[8:38], 2)
+
+    ts_iso = (
+        timestamp.isoformat()
+        if isinstance(timestamp, datetime)
+        else str(timestamp or datetime.now(timezone.utc).isoformat())
+    )
+
+    # Class A Position Reports (Types 1, 2, 3)
+    if msg_type in (1, 2, 3) and len(bits) >= 128:
+        sog_raw = int(bits[50:60], 2)
+        sog = round(sog_raw / 10.0, 1) if sog_raw != 1023 else 0.0
+
+        lon_raw = bits[61:89]
+        lon_int = int(lon_raw, 2)
+        if lon_raw[0] == "1":
+            lon_int -= (1 << 28)
+        lon = round(lon_int / 600000.0, 6)
+
+        lat_raw = bits[89:116]
+        lat_int = int(lat_raw, 2)
+        if lat_raw[0] == "1":
+            lat_int -= (1 << 27)
+        lat = round(lat_int / 600000.0, 6)
+
+        cog_raw = int(bits[116:128], 2)
+        cog = round(cog_raw / 10.0, 1) if cog_raw != 3600 else 0.0
+
+        if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0 and (lon != 181.0 and lat != 91.0):
+            return {"mmsi": mmsi, "timestamp": ts_iso, "lon": lon, "lat": lat, "sog": sog, "cog": cog}
+
+    # Class B Position Reports (Types 18, 19)
+    elif msg_type in (18, 19) and len(bits) >= 124:
+        sog_raw = int(bits[46:56], 2)
+        sog = round(sog_raw / 10.0, 1) if sog_raw != 1023 else 0.0
+
+        lon_raw = bits[57:85]
+        lon_int = int(lon_raw, 2)
+        if lon_raw[0] == "1":
+            lon_int -= (1 << 28)
+        lon = round(lon_int / 600000.0, 6)
+
+        lat_raw = bits[85:112]
+        lat_int = int(lat_raw, 2)
+        if lat_raw[0] == "1":
+            lat_int -= (1 << 27)
+        lat = round(lat_int / 600000.0, 6)
+
+        cog_raw = int(bits[112:124], 2)
+        cog = round(cog_raw / 10.0, 1) if cog_raw != 3600 else 0.0
+
+        if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0 and (lon != 181.0 and lat != 91.0):
+            return {"mmsi": mmsi, "timestamp": ts_iso, "lon": lon, "lat": lat, "sog": sog, "cog": cog}
+
+    return None
+
+
+class AISStreamAdapter:
+    """Threaded TCP socket stream listener and sliding-window buffer for live AIS.
+
+    Decodes NMEA 0183 AIVDM/AIVDO and JSON feeds, buffering live vessel positions
+    into a time-bounded sliding window DataFrame compatible with the 3-tier AISPruner.
+    """
+
+    def __init__(
+        self,
+        buffer_hours: float = 24.0,
+        max_buffer_size: int = 500_000,
+        config: Optional[AISPrunerConfig] = None,
+    ):
+        self.buffer_hours = float(buffer_hours)
+        self.max_buffer_size = int(max_buffer_size)
+        self.config = config or AISPrunerConfig()
+        self._lock = threading.RLock()
+        self._buffer: collections.deque = collections.deque(maxlen=self.max_buffer_size)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._server_socket: Optional[socket.socket] = None
+
+    def ingest_line(
+        self, line: str, timestamp: Optional[Union[datetime, str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Decode and buffer one NMEA or JSON line."""
+        record = decode_nmea_ais_sentence(line, timestamp=timestamp)
+        if record is not None:
+            with self._lock:
+                self._buffer.append(record)
+        return record
+
+    def ingest_records(self, records: Sequence[Dict[str, Any]]) -> int:
+        """Buffer a sequence of dictionary records directly."""
+        count = 0
+        with self._lock:
+            for r in records:
+                self._buffer.append(dict(r))
+                count += 1
+        return count
+
+    def get_dataframe(self) -> pd.DataFrame:
+        """Return the current sliding window buffer as a canonical pandas DataFrame."""
+        with self._lock:
+            if not self._buffer:
+                return _empty_result_frame()
+            df = pd.DataFrame(list(self._buffer))
+
+        if "timestamp" in df.columns:
+            ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=self.buffer_hours)
+            valid = ts >= cutoff
+            df = df.loc[valid].reset_index(drop=True)
+        return df
+
+    def prune(
+        self,
+        origin_lon: float,
+        origin_lat: float,
+        t0_time_str: Union[str, datetime, pd.Timestamp],
+        semi_major_m: float,
+        semi_minor_m: float,
+        orientation_deg: float,
+        temporal_window_hours: Optional[float] = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """Prune buffered AIS records directly against the uncertainty ellipse."""
+        df = self.get_dataframe()
+        if df.empty:
+            return _empty_result_frame()
+        return prune_dataframe(
+            df,
+            origin_lon=origin_lon,
+            origin_lat=origin_lat,
+            t0_time_str=t0_time_str,
+            semi_major_m=semi_major_m,
+            semi_minor_m=semi_minor_m,
+            orientation_deg=orientation_deg,
+            temporal_window_hours=temporal_window_hours,
+            config=self.config,
+            **kwargs,
+        )
+
+    def start_listener(self, host: str = "127.0.0.1", port: int = 10110, is_server: bool = True):
+        """Start a background TCP stream listener thread."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+
+        def _worker():
+            if is_server:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    srv.bind((host, port))
+                    srv.listen(5)
+                    srv.settimeout(1.0)
+                    self._server_socket = srv
+                except Exception as exc:
+                    logger.warning("Could not bind AIS TCP listener on %s:%d: %s", host, port, exc)
+                    self._running = False
+                    return
+
+                while self._running:
+                    try:
+                        conn, _ = srv.accept()
+                        with conn:
+                            conn.settimeout(1.0)
+                            buf = ""
+                            while self._running:
+                                try:
+                                    data = conn.recv(4096).decode("ascii", errors="ignore")
+                                    if not data:
+                                        break
+                                    buf += data
+                                    lines = buf.split("\n")
+                                    buf = lines.pop()
+                                    for line in lines:
+                                        self.ingest_line(line)
+                                except socket.timeout:
+                                    continue
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+            else:
+                while self._running:
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.connect((host, port))
+                        s.settimeout(2.0)
+                        buf = ""
+                        while self._running:
+                            try:
+                                data = s.recv(4096).decode("ascii", errors="ignore")
+                                if not data:
+                                    break
+                                buf += data
+                                lines = buf.split("\n")
+                                buf = lines.pop()
+                                for line in lines:
+                                    self.ingest_line(line)
+                            except socket.timeout:
+                                continue
+                        s.close()
+                    except Exception:
+                        if self._running:
+                            import time
+                            time.sleep(2.0)
+
+        t = threading.Thread(target=_worker, daemon=True, name="AISStreamListener")
+        self._thread = t
+        t.start()
+
+    def stop(self):
+        """Stop background TCP stream listener."""
+        with self._lock:
+            self._running = False
+            if self._server_socket:
+                try:
+                    self._server_socket.close()
+                except Exception:
+                    pass
+                self._server_socket = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+            self._thread = None

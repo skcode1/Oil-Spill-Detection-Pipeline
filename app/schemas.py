@@ -397,6 +397,8 @@ class MetoceanSample(BaseModel):
     v_current_mps: float = Field(..., description="Northward surface current (m/s).")
     u_wind_mps: float = Field(0.0, description="Eastward 10 m wind (m/s).")
     v_wind_mps: float = Field(0.0, description="Northward 10 m wind (m/s).")
+    u_stokes_mps: Optional[float] = Field(0.0, description="Eastward Stokes drift velocity (m/s).")
+    v_stokes_mps: Optional[float] = Field(0.0, description="Northward Stokes drift velocity (m/s).")
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
 
     @field_validator("timestamp_utc")
@@ -532,6 +534,10 @@ class DriftResponse(BaseModel):
     envelope_geojson: Dict[str, Any] = Field(default_factory=dict)
     uncertainty: UncertaintyEllipse
     warnings: List[str] = Field(default_factory=list)
+    wave_provenance: Optional[str] = Field(
+        default="standard_leeway_fallback (u_current + 0.032 * u_wind)",
+        description="Provenance of wave and Stokes drift data used in the drift simulation.",
+    )
 
 
 # --------------------------------------------------------------------------- #
