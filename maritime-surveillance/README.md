@@ -1,4 +1,6 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# maritime-surveillance — Next.js Dashboard
+
+This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://create-next-app.dev/). It is the frontend that consumes the SIH26143 oil-spill detection & vessel-attribution API (`app/main.py` in the repo root).
 
 ## Getting Started
 
@@ -16,9 +18,28 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the page.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## What it consumes
+
+The dashboard calls the FastAPI backend under `/api/v1`:
+
+- `POST /pipeline` / `POST /pipeline/upload` — detection + drift + attribution (+ optional briefing)
+- `POST /drift/hindcast` / `POST /drift/forecast` — forward / backward drift
+- `POST /briefing` — NTRO intelligence narrative from a verified dossier JSON
+- `GET /health` — model / device / checkpoint readiness
+
+It renders the slick polygons (`spillGeoJson`), suspect vessel points and trajectories (`culpritGeoJson`), and stage status on `SurveillanceMap`.
+
+## Map configuration
+
+The tactical map (`src/SurveillanceMap.tsx`) is intentionally region-agnostic:
+
+- The HUD region label (`regionLabel`) is driven by incident metadata (scene filename / slick location name) and falls back to `"Open Ocean"`.
+- The default map center is `[20.0, 0.0]` (neutral open ocean) and recentres automatically to the slick centroid when georeferenced detections are present.
+- Basemaps are free and keyless: OpenStreetMap Standard, ESRI Satellite Imagery, and a Tactical Night Mode variant.
+
+This makes the dashboard usable for arbitrary maritime incident locations worldwide rather than a single hardcoded region.
 
 ## Learn More
 
