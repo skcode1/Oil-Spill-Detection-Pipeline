@@ -264,27 +264,27 @@ class LookalikeFilterSettings:
     """
 
     # Geometry-based heuristics
-    min_confirmed_area_px: float = 200.0
-    max_confirmed_elongation: float = 5.0
-    min_confirmed_solidity: float = 0.5
+    min_confirmed_area_px: float = 50.0
+    max_confirmed_elongation: float = 8.0
+    min_confirmed_solidity: float = 0.3
 
     # Boundary gradient heuristics
-    min_edge_gradient_magnitude: float = 10.0
+    min_edge_gradient_magnitude: float = 2.0
     edge_sample_count: int = 32
 
     # Spatial coherence & morphology
-    max_confirmed_bbox_fill_fraction: float = 0.8
-    max_confirmed_component_count: int = 2
+    max_confirmed_bbox_fill_fraction: float = 0.95
+    max_confirmed_component_count: int = 50
 
     # Confidence scoring
-    min_confident_scene_pixels: int = 2_000_000
-    max_confirmed_oil_coverage_fraction: float = 0.05
+    min_confident_scene_pixels: int = 50_000
+    max_confirmed_oil_coverage_fraction: float = 0.85
 
     # Metadata context
     detect_lookalike_dataset_paths: bool = True
 
     # Overall sensitivity
-    heuristic_threshold_count: int = 2
+    heuristic_threshold_count: int = 3
     use_lookalike_status: bool = True
     enabled: bool = True
 

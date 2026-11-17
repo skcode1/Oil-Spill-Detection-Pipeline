@@ -40,21 +40,21 @@ class LookalikeFilterSettings(BaseModel):
 
     # Geometry-based heuristics
     min_confirmed_area_px: float = Field(
-        default=200.0,
+        default=50.0,
         description="Slicks with area < this threshold (pixels) are considered too small for real oil.",
     )
     max_confirmed_elongation: float = Field(
-        default=5.0,
+        default=8.0,
         description="Elongation (length/width) > this threshold suggests wind slicks or Langmuir patterns.",
     )
     min_confirmed_solidity: float = Field(
-        default=0.5,
+        default=0.3,
         description="Solidity (contour_area / convex_hull_area) < this suggests fragmented patterns.",
     )
 
     # Boundary gradient heuristics
     min_edge_gradient_magnitude: float = Field(
-        default=10.0,
+        default=2.0,
         description="Edge pixels with mean gradient < this threshold suggest lookalike diffuse boundaries.",
     )
     edge_sample_count: int = Field(
@@ -64,21 +64,21 @@ class LookalikeFilterSettings(BaseModel):
 
     # Spatial coherence & morphology
     max_confirmed_bbox_fill_fraction: float = Field(
-        default=0.8,
+        default=0.95,
         description="Slicks occupying > this fraction of a tight bounding box flag uniform artifacts.",
     )
     max_confirmed_component_count: int = Field(
-        default=2,
+        default=50,
         description="Slicks with > this many separate connected components suggest fragmentation.",
     )
 
     # Confidence scoring
     min_confident_scene_pixels: int = Field(
-        default=2_000_000,
+        default=50_000,
         description="When scene size (pixels) is below this, conservatively downgrade.",
     )
     max_confirmed_oil_coverage_fraction: float = Field(
-        default=0.05,
+        default=0.85,
         description="When oil coverage exceeds this, mark as lookalike (likely wind slick).",
     )
 
@@ -90,7 +90,7 @@ class LookalikeFilterSettings(BaseModel):
 
     # Overall sensitivity
     heuristic_threshold_count: int = Field(
-        default=2,
+        default=3,
         description="How many heuristics must flag before status becomes 'Lookalike'.",
     )
     use_lookalike_status: bool = Field(

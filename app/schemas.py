@@ -275,6 +275,17 @@ class SlickGeometry(BaseModel):
         description="Ship detections near this slick (dark-vessel cue).",
     )
 
+    @property
+    def pixel_area(self) -> float:
+        return float(self.area_px)
+
+    @property
+    def perimeter_m(self) -> float:
+        if self.area_m2 is not None and self.area_m2 > 0 and self.area_px > 0:
+            scale = math.sqrt(self.area_m2 / self.area_px)
+            return float(self.perimeter_px * scale)
+        return float(self.perimeter_px * 10.0)
+
 
 class SlickStatistics(BaseModel):
     """Aggregate pixel-level statistics for the processed scene."""

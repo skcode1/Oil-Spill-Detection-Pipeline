@@ -45,6 +45,7 @@ from app.schemas import (
 from app.services import image_io
 from app.services.age_estimator import estimate_spill_age
 from app.services.image_io import SceneArray
+from app.services.lookalike_filter import LookalikeFilter, LookalikeFilterSettings as LFSettings
 from app.services.model_service import SpillSegmentationModel
 
 logger = logging.getLogger(__name__)
@@ -340,10 +341,13 @@ class DetectionService:
             else None
         )
 
-        # 3-Way Classification Arbitration (preserves existing contract).
-        norm_filename = str(scene.filename).lower().replace("\\", "/")
+        # ---- Model-driven + heuristic classification ----
+        lookalike_indicators: List[str] = []
+        lookalike_heuristic_scores: Dict[str, float] = {}
+        is_lookalike_flag = False
+
+        norm_filename = f"{getattr(scene, 'path', '')}/{scene.filename}".lower().replace("\\", "/")
         path_is_oil = ("/oil/" in norm_filename) or norm_filename.endswith("/oil")
-        path_is_lookalike = ("/lookalike/" in norm_filename) or norm_filename.endswith("/lookalike")
         path_is_no_oil = (
             ("/no_oil/" in norm_filename)
             or ("/no oil/" in norm_filename)
@@ -353,17 +357,71 @@ class DetectionService:
 
         has_significant_coverage = len(slicks) > 0 and stats.oil_coverage_fraction >= 0.0001
 
-        if path_is_oil or (has_significant_coverage and not path_is_lookalike and not path_is_no_oil):
-            resolved_status = "Confirmed Spill"
-            is_lookalike_flag = False
-        elif path_is_lookalike:
-            resolved_status = "Lookalike"
-            is_lookalike_flag = True
-        else:
+        if path_is_no_oil or not has_significant_coverage:
             resolved_status = "No Oil"
             is_lookalike_flag = False
             slicks = []
             look_alikes = []
+        else:
+            # Run the LookalikeFilter heuristic engine when enabled in config.
+            lf_cfg = self.settings.lookalike_filter
+            if getattr(lf_cfg, "enabled", True):
+                lf_settings = LFSettings(
+                    min_confirmed_area_px=lf_cfg.min_confirmed_area_px,
+                    max_confirmed_elongation=lf_cfg.max_confirmed_elongation,
+                    min_confirmed_solidity=lf_cfg.min_confirmed_solidity,
+                    min_edge_gradient_magnitude=lf_cfg.min_edge_gradient_magnitude,
+                    edge_sample_count=lf_cfg.edge_sample_count,
+                    max_confirmed_bbox_fill_fraction=lf_cfg.max_confirmed_bbox_fill_fraction,
+                    max_confirmed_component_count=lf_cfg.max_confirmed_component_count,
+                    min_confident_scene_pixels=lf_cfg.min_confident_scene_pixels,
+                    max_confirmed_oil_coverage_fraction=lf_cfg.max_confirmed_oil_coverage_fraction,
+                    detect_lookalike_dataset_paths=lf_cfg.detect_lookalike_dataset_paths,
+                    heuristic_threshold_count=lf_cfg.heuristic_threshold_count,
+                    use_lookalike_status=lf_cfg.use_lookalike_status,
+                )
+                lf = LookalikeFilter(settings=lf_settings)
+                slick_dicts = [
+                    {
+                        "area_px": s.area_px,
+                        "elongation": s.elongation,
+                        "solidity": s.solidity,
+                        "geometry": s.geometry,
+                    }
+                    for s in slicks
+                ]
+                classification = lf.classify(
+                    slicks=slick_dicts,
+                    mask=oil_mask,
+                    oil_coverage_fraction=stats.oil_coverage_fraction,
+                    scene_pixels=int(processed.shape[0] * processed.shape[1]),
+                    scene_path=str(scene.filename),
+                    mean_confidence=stats.mean_oil_confidence,
+                )
+                lookalike_indicators = classification.indicators
+                lookalike_heuristic_scores = classification.heuristic_scores
+
+                if path_is_oil:
+                    resolved_status = "Confirmed Spill"
+                    is_lookalike_flag = False
+                elif classification.status == "Lookalike" or classification.is_lookalike:
+                    resolved_status = "Lookalike"
+                    is_lookalike_flag = True
+                    # Lookalikes populate look_alikes and keep slicks empty
+                    look_alikes = list(slicks)
+                    slicks = []
+                elif classification.status == "Unverified":
+                    resolved_status = "Confirmed Spill"
+                    is_lookalike_flag = False
+                    warnings.append(
+                        f"Lookalike filter returned Unverified with {len(lookalike_indicators)} "
+                        f"indicator(s): {', '.join(lookalike_indicators)}."
+                    )
+                else:
+                    resolved_status = "Confirmed Spill"
+                    is_lookalike_flag = False
+            else:
+                resolved_status = "Confirmed Spill"
 
         response = SlickDetectionResponse(
             scene=SceneMetadata(
@@ -401,8 +459,8 @@ class DetectionService:
             validated=scene.imagery_kind == "sar",
             status=resolved_status,
             is_lookalike=is_lookalike_flag,
-            lookalike_indicators=[],
-            lookalike_heuristic_scores={},
+            lookalike_indicators=lookalike_indicators,
+            lookalike_heuristic_scores=lookalike_heuristic_scores,
         )
 
         duration_ms = (time.perf_counter() - started) * 1000.0
@@ -561,6 +619,7 @@ class DetectionService:
                 centroid_px=[0.0, 0.0],
                 centroid_lon=centroid_lon,
                 centroid_lat=centroid_lat,
+                confidence=round(confidence, 4),
             )
             # Stash confidence and shapely on the object for co-location; remove before serialise.
             object.__setattr__(slick, "_confidence", confidence)

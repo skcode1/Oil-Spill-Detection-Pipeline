@@ -1,3 +1,23 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  DEPRECATED — Legacy monolithic backend                         ║
+║                                                                  ║
+║  This module is superseded by the production API at              ║
+║  ``app/main.py`` (run via ``uvicorn app.main:app``).             ║
+║                                                                  ║
+║  All new development MUST target the ``app/`` package.           ║
+║  This file is retained only for backward-compatibility           ║
+║  reference and will be removed in a future release.              ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+import warnings as _warnings
+_warnings.warn(
+    "backend/main.py is deprecated. Use 'uvicorn app.main:app' instead.",
+    DeprecationWarning,
+    stacklevel=1,
+)
+
 import os
 import sys
 import glob

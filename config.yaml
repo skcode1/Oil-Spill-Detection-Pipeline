@@ -20,12 +20,10 @@ model:
   encoder: "resnet34"
   encoder_weights: "imagenet"
   in_channels: 3                    # [VV, VH, VV/VH ratio] — model expects 3-channel SAR composite
-  classes: 5                        # 0: Sea Surface, 1: Oil Spill, 2: Look-Alike, 3: Ship, 4: Land
-  class_names: ["sea_surface", "oil_spill", "look_alike", "ship", "land"]
+  classes: 3                        # Checkpoint provides 3 classes: 0 Background, 1 Oil Spill, 2 Look-Alike
+  class_names: ["background", "oil_spill", "look_alike"]
   oil_class_index: 1
   lookalike_class_index: 2
-  ship_class_index: 3
-  land_class_index: 4
   background_class_index: 0
   input_size: [512, 512]
   # 0.90 operating point keeps no-oil scenes free of false slicks with the
@@ -60,22 +58,22 @@ inference:
 lookalike_filter:
   enabled: true
   # Geometry-based heuristics
-  min_confirmed_area_px: 200.0         # Minimum area for confirmed true oil
-  max_confirmed_elongation: 5.0        # Max length/width ratio
-  min_confirmed_solidity: 0.5          # Min contour_area/convex_hull_area
+  min_confirmed_area_px: 50.0          # Minimum area for confirmed true oil
+  max_confirmed_elongation: 8.0        # Max length/width ratio
+  min_confirmed_solidity: 0.3          # Min contour_area/convex_hull_area
   # Boundary gradient heuristics
-  min_edge_gradient_magnitude: 10.0    # Minimum edge sharpness
+  min_edge_gradient_magnitude: 2.0     # Minimum edge sharpness
   edge_sample_count: 32                # Contour sampling resolution
   # Spatial coherence & morphology
-  max_confirmed_bbox_fill_fraction: 0.8  # Max area/bbox ratio (uniform patterns = lookalike)
-  max_confirmed_component_count: 2     # Max connected components
+  max_confirmed_bbox_fill_fraction: 0.95 # Max area/bbox ratio (uniform patterns = lookalike)
+  max_confirmed_component_count: 50    # Max connected components
   # Confidence scoring
-  min_confident_scene_pixels: 2000000  # Small test chips get downgraded
-  max_confirmed_oil_coverage_fraction: 0.05  # High coverage flags wind slicks
+  min_confident_scene_pixels: 50000    # Small test chips get downgraded
+  max_confirmed_oil_coverage_fraction: 0.85 # High coverage flags wind slicks
   # Metadata context
   detect_lookalike_dataset_paths: true # Detect "lookalike" in path
   # Overall sensitivity
-  heuristic_threshold_count: 2         # Num heuristics that must trigger
+  heuristic_threshold_count: 3         # Num heuristics that must trigger
   use_lookalike_status: true           # Use "Lookalike" status vs confidence downgrade
 
 ais:
