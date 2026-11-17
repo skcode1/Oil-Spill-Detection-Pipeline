@@ -73,54 +73,106 @@ def _scene_normalise(image: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported SAR image shape {image.shape}")
 
 
+def _linear_to_db(vv: np.ndarray, floor: float = -30.0, ceil: float = 0.0) -> np.ndarray:
+    """Convert calibrated linear backscatter to dB, clipped to [floor, ceil]."""
+    vv = np.asarray(vv, dtype=np.float32)
+    vv = np.maximum(vv, 1e-8)  # avoid log(0)
+    db = 10.0 * np.log10(vv ** 2 + 1e-12)  # sigma^0 in dB
+    return np.clip(db, floor, ceil)
+
+
+def _local_variance(channel: np.ndarray, ksize: int = 5) -> np.ndarray:
+    """Local texture variance in a ksize x ksize window.
+
+    Oil slicks dampen capillary waves uniformly -> low local variance.
+    Biogenic films / wind fronts show distinct edge gradients -> high variance.
+    """
+    channel = np.asarray(channel, dtype=np.float32)
+    if ksize < 3:
+        return np.zeros_like(channel)
+    mean = cv2.boxFilter(channel, -1, (ksize, ksize), normalize=True)
+    mean_sq = cv2.boxFilter(channel * channel, -1, (ksize, ksize), normalize=True)
+    var = mean_sq - mean * mean
+    return np.maximum(var, 0.0)
+
+
+def _normalize01(arr: np.ndarray) -> np.ndarray:
+    """Min-max normalise to [0, 1] with epsilon guard."""
+    arr = np.asarray(arr, dtype=np.float32)
+    mn, mx = float(arr.min()), float(arr.max())
+    if mx - mn < 1e-8:
+        return np.zeros_like(arr)
+    return (arr - mn) / (mx - mn)
+
+
+def _sar_to_physics_tensor(image: np.ndarray) -> np.ndarray:
+    """Build a physics-informed 3-channel SAR tensor.
+
+    Channel 0: calibrated sigma_VV^0 in dB (clipped [-30, 0]).
+    Channel 1: local texture variance (5x5 window) - oil = low variance,
+               look-alikes / wind fronts = high variance.
+    Channel 2: VH/VV cross-pol ratio when dual-pol available; otherwise a
+               land-sea / coastal prior derived from VV magnitude.
+    Returns HWC float32 array.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim == 2:
+        vv = image
+        vh = None
+    elif image.ndim == 3 and image.shape[-1] == 1:
+        vv = image[:, :, 0]
+        vh = None
+    elif image.ndim == 3 and image.shape[-1] == 2:
+        vv = image[:, :, 0]
+        vh = image[:, :, 1]
+    elif image.ndim == 3 and image.shape[-1] == 3:
+        # Already a composite: treat first channel as VV, second as VH.
+        vv = image[:, :, 0]
+        vh = image[:, :, 1]
+    else:
+        raise ValueError(f"Unsupported SAR image shape {image.shape}")
+
+    # Channel 0: calibrated VV backscatter in dB
+    ch0 = _linear_to_db(vv)
+
+    # Channel 1: local texture variance (5x5)
+    ch1 = _local_variance(vv, ksize=5)
+
+    # Channel 2: cross-pol ratio or VV-magnitude proxy
+    if vh is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.divide(vh, vv + 1e-8)
+        ch2 = _normalize01(np.nan_to_num(ratio, nan=0.0, posinf=1.0, neginf=0.0))
+    else:
+        # Land-sea / coastal prior: bright VV -> likely land/coast, dark -> sea
+        ch2 = _normalize01(vv)
+
+    # Normalise each channel to [0, 1] for the model
+    ch0 = _normalize01(ch0)
+    ch1 = _normalize01(ch1)
+    ch2 = _normalize01(ch2)
+
+    return np.stack([ch0, ch1, ch2], axis=-1)
+
+
 def sar_to_three_channel(image: np.ndarray, *, normalisation: str = "per_tile") -> np.ndarray:
-    """Convert a SAR image array to a 3-channel float32 array in [0, 1].
+    """Convert a SAR image array to a physics-informed 3-channel float32 array.
+
+    Channel layout (physics-informed, look-alike hardened):
+
+    * Channel 0: calibrated sigma_VV^0 backscatter in dB, clipped [-30, 0]
+    * Channel 1: local texture variance (5x5 window) - oil = low variance
+    * Channel 2: VH/VV cross-pol ratio (dual-pol) or VV-magnitude proxy (single-pol)
 
     Mirrors ``dataset._sar_to_three_channel`` so training and inference
-    produce identical channel layouts:
-
-    * 2-channel (VV, VH)  ->  [VV, VH, VV+VH]
-    * 1-channel           ->  [VV, VV, VV]  (broadcast)
-    * 3-channel (HWC)     ->  returned as-is (each normalised)
+    produce identical channel layouts.
 
     Args:
         image: Input SAR array (HxW, HxWx2, or HxWx3).
-        normalisation: "per_tile" (default) normalises each tile independently,
-            matching the training chip distribution. "scene" assumes the caller
-            has already normalised the full scene; this function then only
-            rearranges channels without re-normalising.
+        normalisation: kept for API compatibility; channels are always
+            min-max normalised to [0, 1] inside this function.
     """
-    image = np.asarray(image, dtype=np.float32)
-    if normalisation == "scene":
-        # Caller already normalised the full scene; just ensure 3 channels.
-        if image.ndim == 2:
-            return np.stack([image, image, image], axis=-1)
-        if image.ndim == 3:
-            c = image.shape[-1]
-            if c == 2:
-                vv, vh = image[:, :, 0], image[:, :, 1]
-                comp = vv + vh
-                return np.stack([vv, vh, comp], axis=-1)
-            if c == 3:
-                return image
-        raise ValueError(f"Unsupported SAR image shape {image.shape}")
-
-    # per_tile: normalise each tile independently (original behaviour)
-    if image.ndim == 2:
-        channel = _minmax_norm(image)
-        return np.stack([channel, channel, channel], axis=-1)
-
-    if image.ndim == 3:
-        c = image.shape[-1]
-        if c == 2:
-            vv = _minmax_norm(image[:, :, 0])
-            vh = _minmax_norm(image[:, :, 1])
-            comp = _minmax_norm(image[:, :, 0] + image[:, :, 1])
-            return np.stack([vv, vh, comp], axis=-1)
-        if c == 3:
-            channels = [_minmax_norm(image[:, :, i]) for i in range(3)]
-            return np.stack(channels, axis=-1)
-    raise ValueError(f"Unsupported SAR image shape {image.shape}")
+    return _sar_to_physics_tensor(image)
 
 
 def _load_config(path: str = "config.yaml") -> dict:
@@ -218,15 +270,6 @@ def predict_mask(
     # ---- Read raw SAR image ----
     arr = tiff.imread(image_path)
 
-    # Normalisation mode:
-    # - "per_tile": each tile is min-max normalised independently (matches training chips)
-    # - "scene": whole scene is min-max normalised once, then tiled
-    if normalisation == "scene":
-        arr = _scene_normalise(arr)
-
-    orig_h, orig_w = (arr.shape[0], arr.shape[1])
-    orig_size = (orig_w, orig_h)
-
     # ---- Georeferencing metadata ----
     transform_meta = None
     crs_meta = None
@@ -237,6 +280,9 @@ def predict_mask(
                 crs_meta = src.crs
         except Exception:
             pass
+
+    orig_h, orig_w = int(arr.shape[0]), int(arr.shape[1])
+    orig_size = (orig_w, orig_h)
 
     # ---- Sliding-window inference for large scenes ----
     h, w = arr.shape[:2]

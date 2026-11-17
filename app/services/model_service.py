@@ -36,7 +36,7 @@ from app.errors import ModelNotReadyError
 from app.schemas import ModelInfo
 
 # Reuse the canonical, already-validated helpers from the existing codebase.
-from src.detect_and_vectorize import _scene_normalise, load_trained_model, sar_to_three_channel
+from src.detect_and_vectorize import load_trained_model, sar_to_three_channel
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ class SpillSegmentationModel:
         self._load_duration_ms = 0.0
         self._resolved: Dict[str, Any] = {}
         self._norm_mean, self._norm_std = self._normalisation_stats()
+        self._val_oil_iou: Optional[float] = None
 
     # ------------------------------------------------------------------ load
     @property
@@ -211,6 +212,12 @@ class SpillSegmentationModel:
                         "Inferred %d classes from checkpoint segmentation head.", num_classes
                     )
 
+                if isinstance(checkpoint_state, dict) and "val_oil_iou" in checkpoint_state:
+                    self._val_oil_iou = float(checkpoint_state["val_oil_iou"])
+                    self.log.info(
+                        "Checkpoint validation Oil Spill IoU: %.4f", self._val_oil_iou
+                    )
+
                 if architecture == "deeplabv3plus":
                     model = smp.DeepLabV3Plus(
                         encoder_name=self.settings.model.encoder,
@@ -299,6 +306,7 @@ class SpillSegmentationModel:
             load_duration_ms=round(self._load_duration_ms, 2),
             parameters=int(self._resolved.get("parameters", 0)),
             error=self._load_error,
+            val_oil_iou=self._val_oil_iou,
         )
 
     def close(self) -> None:
@@ -382,15 +390,10 @@ class SpillSegmentationModel:
             batch_size = max(1, int(tile_batch_size or inference.tile_batch_size))
             normalisation = getattr(inference, "normalisation", "per_tile")
 
-            # Channel layout must match training: [VV, VH, VV+VH].
-            # Normalisation mode:
-            # - "per_tile": each tile is min-max normalised independently (matches training chips)
-            # - "scene": whole scene is min-max normalised once, then tiled
+            # Channel layout must match training: physics-informed 3-channel
+            # tensor (dB VV, local texture variance, VH/VV ratio).
+            # Normalisation is applied inside sar_to_three_channel per channel.
             height, width = int(image.shape[0]), int(image.shape[1])
-
-            if normalisation == "scene":
-                # Normalise the full scene once before tiling
-                image = _scene_normalise(image)
 
             num_classes = int(
                 self._resolved.get("num_classes", self.settings.model.classes)

@@ -360,6 +360,10 @@ class AisSettings:
     #: Default AIS CSV path used when a request doesn't specify one and the
     #: scene is geographic.  Resolved against the project root.
     default_csv: Optional[str] = None
+    #: Hard-block: never fabricate AIS vessel tracks when real data has no
+    #: spatio-temporal overlap with the drift envelope.  When true, FastAPI
+    #: startup raises RuntimeError to fail-closed.
+    allow_synthetic_ais: bool = False
 
 
 @dataclass(frozen=True)

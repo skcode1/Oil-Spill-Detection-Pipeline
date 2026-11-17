@@ -22,6 +22,7 @@ from glob import glob
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import torch
 from fastapi import Depends, Request
 
 from app.config import (
@@ -123,6 +124,19 @@ def build_services(
                 info.load_duration_ms,
                 f"{info.parameters:,}" if info.parameters else "unknown",
             )
+            # Fail-closed validation: run a dummy (1, 3, 512, 512) forward pass
+            # so a corrupted / mismatched checkpoint is caught at startup rather
+            # than on the first detection request.
+            if model.ready and model._model is not None:
+                try:
+                    dummy = torch.zeros(1, 3, 512, 512, device=model._device)
+                    with torch.no_grad():
+                        _ = model._model(dummy)
+                    logger.info("Dummy forward pass (1, 3, 512, 512) succeeded.")
+                except Exception as exc:  # noqa: BLE001
+                    model._model = None
+                    model._load_error = f"Dummy forward pass failed: {exc}"
+                    logger.error("Checkpoint failed dummy forward pass: %s", exc)
 
     detection = DetectionService(resolved, model)
     drift = DriftService(resolved)

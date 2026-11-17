@@ -127,6 +127,16 @@ def _lifespan(
         if getattr(app.state, "services", None) is None:
             app.state.services = build_services(settings, load_model=load_model)
         container: AppServices = app.state.services
+
+        # Fail-closed guard: synthetic AIS track injection invalidates the
+        # evidence chain and must never be enabled in production.
+        if container.settings.ais.allow_synthetic_ais:
+            raise RuntimeError(
+                "attribution.allow_synthetic_ais is true: fabricating AIS vessel "
+                "tracks invalidates the evidence chain. Set it to false in "
+                "config.yaml."
+            )
+
         logger.info(
             "Startup complete: model ready=%s on %s, services built at %s",
             container.model.ready,

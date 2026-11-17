@@ -27,8 +27,9 @@ from src.environment_fetcher import build_environment_manifest
 # --------------------------------------------------------------------------- #
 def test_pipeline_options_new_fields_defaults_false():
     opts = PipelineOptions(run_attribution=False)
-    assert opts.fetch_live_metocean is False
+    assert opts.fetch_live_metocean is True
     assert opts.generate_briefing is False
+    assert opts.strict_metocean is False
 
 
 def test_pipeline_options_new_fields_explicit():

@@ -298,8 +298,8 @@ export default function MaritimeDashboard() {
     : [defaultLocation.lat, defaultLocation.lon];
 
   const locationTitle = hasCentroid
-    ? (geoStats!.location_name || "Persian Gulf")
-    : (sceneMeta?.filename || defaultLocation.name);
+    ? (geoStats!.location_name || sceneMeta?.filename || "Maritime Incident")
+    : (sceneMeta?.filename || "Maritime Incident");
 
   const coordinatesSubtitle = hasCentroid
     ? `${Number(geoStats!.centroid_lat).toFixed(4)}°N, ${Number(geoStats!.centroid_lon).toFixed(4)}°E`
@@ -572,6 +572,12 @@ export default function MaritimeDashboard() {
               showVessel={showVessel}
               center={mapCenter}
               regionLabel={locationTitle}
+              sceneBounds={sceneMeta?.bbox_wgs84 ?? null}
+              sceneCenter={
+                sceneMeta?.center_lon != null && sceneMeta?.center_lat != null
+                  ? [sceneMeta.center_lon, sceneMeta.center_lat]
+                  : null
+              }
             />
           </div>
         </div>

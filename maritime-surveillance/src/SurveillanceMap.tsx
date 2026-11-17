@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -19,6 +19,8 @@ interface MapProps {
   showVessel: boolean;
   center?: [number, number];
   regionLabel?: string;
+  sceneBounds?: [number, number, number, number];
+  sceneCenter?: [number, number];
 }
 
 const createPulseIcon = (color: string) => {
@@ -102,14 +104,33 @@ export default function SurveillanceMap({
   showVessel,
   center = [20.0, 0.0],
   regionLabel = "MARITIME SURVEILLANCE",
+  sceneBounds,
+  sceneCenter,
 }: MapProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
+  const mapRef = useRef<L.Map | null>(null);
 
   useEffect(() => {
     setIsMounted(true);
     return () => setIsMounted(false);
   }, []);
+
+  // Fit the map to the scene bounds whenever a new dossier arrives
+  useEffect(() => {
+    if (!mapRef.current || !sceneBounds) return;
+    try {
+      mapRef.current.fitBounds(
+        [
+          [sceneBounds[1], sceneBounds[0]], // [min_lat, min_lon]
+          [sceneBounds[3], sceneBounds[2]], // [max_lat, max_lon]
+        ],
+        { padding: [40, 40] }
+      );
+    } catch {
+      // fitBounds can fail if bounds are degenerate; fall back to center
+    }
+  }, [sceneBounds]);
 
   if (!isMounted) {
     return <div className="w-full h-full bg-slate-950 min-h-[550px]" />;
@@ -190,7 +211,16 @@ export default function SurveillanceMap({
       <div className="absolute top-3 left-3 z-[1000] flex items-center gap-2 bg-slate-900/90 backdrop-blur-md px-3.5 py-1.5 rounded-lg border border-slate-700/60 shadow-lg pointer-events-auto">
         <Compass className="w-4 h-4 text-indigo-400 animate-spin" />
         <span className="text-xs font-mono font-semibold tracking-wider text-slate-200">
-          {regionLabel}
+          {sceneCenter ? (
+            <>
+              {sceneCenter[1] >= 0 ? "N" : "S"}
+              {Math.abs(sceneCenter[1]).toFixed(4)}°{" "}
+              {sceneCenter[0] >= 0 ? "E" : "W"}
+              {Math.abs(sceneCenter[0]).toFixed(4)}°
+            </>
+          ) : (
+            regionLabel
+          )}
         </span>
         <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1"></span>
       </div>
@@ -208,9 +238,10 @@ export default function SurveillanceMap({
 
       <MapContainer
         key={`map-${isFullscreen ? "fullscreen" : "inline"}`}
+        ref={mapRef}
         center={center}
-        zoom={8}
-        minZoom={4}
+        zoom={4}
+        minZoom={2}
         maxZoom={18}
         scrollWheelZoom={true}
         zoomControl={false}

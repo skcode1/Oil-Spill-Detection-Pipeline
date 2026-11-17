@@ -87,12 +87,6 @@ ais:
   # Used only for geographic scenes; pixel-space scenes skip attribution.
   default_csv: "data/processed/simulated_ais_traffic.csv"
 
-map_dashboard:
-  mapbox_style: "carto-positron"
-  center_lat: 25.9527
-  center_lon: 53.3438
-  initial_zoom: 8
-
 # End-to-end orchestrator defaults (src/run_pipeline.py). CLI flags override
 # these values; every former in-code literal now lives here.
 pipeline:
@@ -115,6 +109,10 @@ attribution:
   # SOG window (knots) at CPA treated as discharge-consistent behavior.
   discharge_speed_band: [1.5, 6.0]
   sigma_t_minutes: 60
+  # Hard-block: never fabricate AIS vessel tracks when the real data has no
+  # spatio-temporal overlap with the drift envelope.  When true, FastAPI startup
+  # raises RuntimeError to fail-closed instead of emitting synthetic suspects.
+  allow_synthetic_ais: false
   gap_decay_minutes: 45
   blackout_gap_minutes: 30
   kinematic_radius_meters: 15000

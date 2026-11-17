@@ -346,6 +346,15 @@ class AttributionService:
             request.chunksize,
             include_funnel=request.include_traffic_reconstruction,
         )
+        # Empty-result contract: never fabricate culprit vessels.  When no real
+        # AIS pings intersect the spatio-temporal envelope, return candidates []
+        # with an explicit warning so the dossier is auditable.
+        if bundle.frame is None or bundle.frame.empty:
+            geometry.warnings.append(
+                "zero_ais_candidates_in_envelope: no real AIS pings intersect the "
+                "drift-origin spatio-temporal envelope; attribution returns no "
+                "candidates (dark-vessel alerts may still apply from SAR)."
+            )
 
         artifact_dir = self._artifact_dir(geometry)
         weights, board = self._rank(
@@ -383,6 +392,7 @@ class AttributionService:
             traffic_filter=bundle.summary,
             candidates=candidates,
             dark_vessel_alerts=dark_vessels,
+            warnings=geometry.warnings,
             attribution_geojson=geojson,
             artifact_paths=artifacts,
         )

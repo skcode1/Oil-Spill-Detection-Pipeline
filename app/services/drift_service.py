@@ -41,6 +41,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from fastapi import HTTPException
+
 import numpy as np
 from shapely.geometry import Polygon, mapping
 from shapely.geometry.base import BaseGeometry
@@ -540,18 +542,20 @@ class DriftService:
         request: DriftRequest,
         *,
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> DriftResponse:
         """Trace a slick backwards from sensing time to its likely origin."""
-        return self._run(request, direction="backward", metocean_paths=metocean_paths)
+        return self._run(request, direction="backward", metocean_paths=metocean_paths, strict_metocean=strict_metocean)
 
     def run_forecast(
         self,
         request: DriftRequest,
         *,
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> DriftResponse:
         """Propagate a release forward to predict the future slick extent."""
-        return self._run(request, direction="forward", metocean_paths=metocean_paths)
+        return self._run(request, direction="forward", metocean_paths=metocean_paths, strict_metocean=strict_metocean)
 
     def _run(
         self,
@@ -559,11 +563,14 @@ class DriftService:
         *,
         direction: str,
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> DriftResponse:
         warnings: List[str] = []
         start = parse_time(request.start_time_utc)
         wind_drift_factor, diffusivity, confidence = self._physics(request)
-        field = self._resolve_field(request, start, warnings, metocean_paths=metocean_paths)
+        field = self._resolve_field(
+            request, start, warnings, metocean_paths=metocean_paths, strict_metocean=strict_metocean
+        )
         if field.wind_drift_factor is not None and request.wind_drift_factor is None:
             wind_drift_factor = field.wind_drift_factor
             warnings.append(
@@ -623,6 +630,7 @@ class DriftService:
         start: datetime,
         warnings: List[str],
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> MetoceanField:
         """Build the metocean field for the Lagrangian engine.
 
@@ -637,6 +645,17 @@ class DriftService:
         if field is not None:
             return field
         defaults = self.settings.metocean
+        if strict_metocean:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "strict_metocean_required",
+                    "message": "strict_metocean=true but no live metocean, manifest, or "
+                    "readable NetCDF files are available. Refusing to run drift on "
+                    "static config fallback vectors.",
+                    "warnings": warnings,
+                },
+            )
         warnings.append(
             "No metocean samples supplied: using the config fallback field for "
             f"'{defaults.fallback_region}' (current=({defaults.fallback_current_u_mps}, "

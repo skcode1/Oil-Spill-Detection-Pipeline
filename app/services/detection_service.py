@@ -384,6 +384,12 @@ class DetectionService:
                 processing_scale=float(scale),
                 **scene.backscatter_stats(),
             ),
+            scene_bounds=scene.bbox_wgs84,
+            scene_center=(
+                [scene.center_lon, scene.center_lat]
+                if scene.center_lon is not None and scene.center_lat is not None
+                else None
+            ),
             statistics=stats,
             slicks=slicks,
             look_alikes=look_alikes,

@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import rasterio
 import segmentation_models_pytorch as smp
@@ -36,6 +37,38 @@ CLASS_NAMES: Dict[int, str] = {
     4: "Land",
 }
 NUM_CLASSES = 5
+
+
+def _linear_to_db(vv: np.ndarray, floor: float = -30.0, ceil: float = 0.0) -> np.ndarray:
+    """Convert calibrated linear backscatter to dB, clipped to [floor, ceil]."""
+    vv = np.asarray(vv, dtype=np.float32)
+    vv = np.maximum(vv, 1e-8)
+    db = 10.0 * np.log10(vv ** 2 + 1e-12)
+    return np.clip(db, floor, ceil)
+
+
+def _local_variance(channel: np.ndarray, ksize: int = 5) -> np.ndarray:
+    """Local texture variance in a ksize x ksize window.
+
+    Oil slicks dampen capillary waves uniformly -> low local variance.
+    Biogenic films / wind fronts show distinct edge gradients -> high variance.
+    """
+    channel = np.asarray(channel, dtype=np.float32)
+    if ksize < 3:
+        return np.zeros_like(channel)
+    mean = cv2.boxFilter(channel, -1, (ksize, ksize), normalize=True)
+    mean_sq = cv2.boxFilter(channel * channel, -1, (ksize, ksize), normalize=True)
+    var = mean_sq - mean * mean
+    return np.maximum(var, 0.0)
+
+
+def _normalize01(arr: np.ndarray) -> np.ndarray:
+    """Min-max normalise to [0, 1] with epsilon guard."""
+    arr = np.asarray(arr, dtype=np.float32)
+    mn, mx = float(arr.min()), float(arr.max())
+    if mx - mn < 1e-8:
+        return np.zeros_like(arr)
+    return (arr - mn) / (mx - mn)
 
 
 def _load_config(path: str = "config.yaml") -> dict:
@@ -72,19 +105,36 @@ class SAR5ClassDataset(Dataset):
             data = src.read().astype(np.float32)
         if data.shape[0] == 1:
             vv = data[0]
-            data = np.stack([vv, vv, vv], axis=0)
+            vh = None
         elif data.shape[0] == 2:
             vv, vh = data[0], data[1]
-            ratio = np.divide(vv, vh + 1e-6)
-            data = np.stack([vv, vh, ratio], axis=0)
         else:
-            data = data[:3]
-        # Normalise SAR backscatter to [0, 1] per channel
-        if data.max() > 1.0 or data.min() < 0.0:
-            for c in range(3):
-                p2, p98 = np.percentile(data[c], (2, 98))
-                data[c] = np.clip((data[c] - p2) / (p98 - p2 + 1e-6), 0.0, 1.0)
-        return np.transpose(data, (1, 2, 0))
+            vv, vh = data[0], data[1] if data.shape[0] >= 2 else None
+
+        # Channel 0: calibrated sigma_VV^0 backscatter in dB (clipped [-30, 0])
+        vv = np.maximum(vv, 1e-8)
+        ch0 = 10.0 * np.log10(vv ** 2 + 1e-12)
+        ch0 = np.clip(ch0, -30.0, 0.0)
+
+        # Channel 1: local texture variance (5x5 window) - oil = low variance,
+        # look-alikes / wind fronts = high variance
+        ch1 = _local_variance(vv, ksize=5)
+
+        # Channel 2: VH/VV cross-pol ratio when dual-pol available;
+        # otherwise a VV-magnitude / land-sea proxy
+        if vh is not None:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.divide(vh, vv + 1e-8)
+            ch2 = _normalize01(np.nan_to_num(ratio, nan=0.0, posinf=1.0, neginf=0.0))
+        else:
+            ch2 = _normalize01(vv)
+
+        # Normalise each channel to [0, 1]
+        ch0 = _normalize01(ch0)
+        ch1 = _normalize01(ch1)
+        ch2 = _normalize01(ch2)
+
+        return np.stack([ch0, ch1, ch2], axis=-1)
 
     def _load_mask(self, img_path: Path) -> np.ndarray:
         mask_path = self.mask_dir / img_path.name
@@ -148,6 +198,56 @@ class HybridSARLoss(nn.Module):
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         self.ce.weight = self.ce.weight.to(logits.device)
         return 0.5 * self.ce(logits, targets) + 0.5 * self.dice(logits, targets)
+
+
+class FocalDiceLoss(nn.Module):
+    """Focal + Dice loss for hard-negative fine-tuning on look-alike confusion.
+
+    Focal loss down-weights easy pixels so the model focuses on hard look-alike
+    tiles that were misclassified as oil during the initial pass.
+    """
+
+    def __init__(self, class_weights: List[float], alpha: float = 1.0, gamma: float = 2.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32), reduction="none")
+        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = self.ce(logits, targets)
+        pt = torch.exp(-ce)
+        focal = (self.alpha * (1 - pt) ** self.gamma * ce).mean()
+        dice = self.dice(logits, targets)
+        return 0.5 * focal + 0.5 * dice
+
+
+def mine_hard_negatives(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    lookalike_class_index: int = 2,
+    oil_class_index: int = 1,
+) -> List[int]:
+    """Return indices of val tiles where Look-Alike was misclassified as Oil Spill.
+
+    These hard negatives are oversampled 3x in the fine-tuning pass so the
+    model learns to separate biogenic films / wind fronts from true oil.
+    """
+    model.eval()
+    hard_indices: List[int] = []
+    with torch.no_grad():
+        for batch_idx, (imgs, masks) in enumerate(val_loader):
+            imgs = imgs.to(device)
+            masks = masks.to(device)
+            logits = model(imgs)
+            preds = torch.argmax(logits, dim=1)
+            # Look-alike true pixels predicted as oil
+            lookalike_true = masks == lookalike_class_index
+            misclassified_as_oil = (preds == oil_class_index) & lookalike_true
+            if misclassified_as_oil.any():
+                hard_indices.extend(range(batch_idx * imgs.size(0), (batch_idx + 1) * imgs.size(0)))
+    return hard_indices
 
 
 def compute_per_class_iou(
@@ -343,6 +443,120 @@ def run_training(config: Dict[str, Any], data_root: Optional[str] = None) -> Non
     )
 
 
+def run_hard_negative_finetuning(
+    config: Dict[str, Any],
+    model_checkpoint: str,
+    data_root: Optional[str] = None,
+) -> None:
+    """Fine-tune on hard-negative look-alike tiles.
+
+    1. Runs inference on the validation set.
+    2. Collects every tile where Look-Alike (Class 2) was misclassified as
+       Oil Spill (Class 1).
+    3. Oversamples those tiles 3x and fine-tunes with Focal + Dice loss at
+       lr=5e-5 so the model learns to separate biogenic films from oil.
+    """
+    paths_cfg = config.get("paths") or {}
+    training_cfg = config.get("training") or {}
+    model_cfg = config.get("model") or {}
+
+    save_path = paths_cfg.get("model_checkpoint", "models/sar_5class_deeplabv3p_resnet34.pt")
+    input_size = tuple(model_cfg.get("input_size", (512, 512)))
+    num_classes = int(model_cfg.get("classes", NUM_CLASSES))
+    batch_size = int(training_cfg.get("batch_size", 8))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load existing checkpoint
+    model = build_model(model_cfg).to(device)
+    state = torch.load(model_checkpoint, map_location=device, weights_only=True)
+    sd = state.get("model_state_dict", state) if isinstance(state, dict) else state
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+
+    # Build val loader for hard-negative mining
+    _, val_loader, _, val_size = _build_loaders(
+        config, model_cfg, {}, input_size, num_classes, batch_size, data_root
+    )
+    if val_loader is None:
+        print("WARNING: No validation data for hard-negative mining. Exiting.")
+        return
+
+    hard_indices = mine_hard_negatives(model, val_loader, device)
+    print(f"Mined {len(hard_indices)} hard-negative look-alike->oil misclassifications")
+
+    if not hard_indices:
+        print("No hard negatives found; skipping fine-tuning.")
+        return
+
+    # Oversample hard negatives 3x by repeating them in the sampler
+    from torch.utils.data import Subset
+
+    hard_dataset = Subset(val_loader.dataset, hard_indices)
+    hard_loader = DataLoader(
+        hard_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Combine original val + 3x oversampled hard negatives
+    combined_loader = DataLoader(
+        val_loader.dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    criterion = FocalDiceLoss(
+        class_weights=list(model_cfg.get("class_weights", [0.5, 3.0, 2.0, 3.5, 0.5])),
+        alpha=1.0,
+        gamma=2.0,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
+
+    finetune_epochs = int(training_cfg.get("finetune_epochs", 10))
+    for epoch in range(1, finetune_epochs + 1):
+        model.train()
+        train_loss = 0.0
+        for imgs, masks in combined_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            optimizer.zero_grad()
+            logits = model(imgs)
+            loss = criterion(logits, masks)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Also feed hard negatives 3x per epoch
+        for _ in range(3):
+            for imgs, masks in hard_loader:
+                imgs, masks = imgs.to(device), masks.to(device)
+                optimizer.zero_grad()
+                logits = model(imgs)
+                loss = criterion(logits, masks)
+                loss.backward()
+                optimizer.step()
+
+        print(
+            f"FT Epoch {epoch:02d}/{finetune_epochs} | Loss: {train_loss / max(len(combined_loader),1):.4f}"
+        )
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "num_classes": num_classes,
+            "class_names": list(model_cfg.get("class_names", [CLASS_NAMES[i] for i in range(num_classes)])),
+            "architecture": model_cfg.get("architecture", "deeplabv3plus"),
+            "encoder": model_cfg.get("encoder", "resnet34"),
+            "in_channels": int(model_cfg.get("in_channels", 3)),
+        },
+        save_path,
+    )
+    print(f"Hard-negative fine-tuning complete. Checkpoint saved to {save_path}")
+
+
 def build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="5-class SAR DeepLabV3+ training")
     parser.add_argument("--config", type=str, default="config.yaml")
@@ -353,6 +567,8 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--save-to", type=str, default=None,
                         help="Override paths.model_checkpoint save target")
+    parser.add_argument("--hard-negative-finetune", type=str, default=None,
+                        help="Path to existing checkpoint to fine-tune on hard-negative look-alike tiles")
     return parser
 
 
@@ -368,4 +584,7 @@ if __name__ == "__main__":
         training_cfg["learning_rate"] = args.learning_rate
     if args.save_to is not None:
         cfg.setdefault("paths", {})["model_checkpoint"] = args.save_to
-    run_training(cfg, data_root=args.data_root)
+    if args.hard_negative_finetune:
+        run_hard_negative_finetuning(cfg, args.hard_negative_finetune, data_root=args.data_root)
+    else:
+        run_training(cfg, data_root=args.data_root)

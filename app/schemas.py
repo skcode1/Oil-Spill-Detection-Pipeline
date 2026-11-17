@@ -318,6 +318,15 @@ class SlickDetectionResponse(BaseModel):
     """Full detection payload: scene metadata, statistics, slicks and age."""
 
     scene: SceneMetadata
+    #: Scene bounding box [min_lon, min_lat, max_lon, max_lat] in EPSG:4326,
+    #    extracted from the GeoTIFF bounds. Used by the frontend to frame the map.
+    scene_bounds: Optional[List[float]] = Field(
+        None, description="Scene bounding box [min_lon, min_lat, max_lon, max_lat]."
+    )
+    #: Scene center [lon, lat] in EPSG:4326, extracted from the GeoTIFF bounds.
+    scene_center: Optional[List[float]] = Field(
+        None, description="Scene center [lon, lat]."
+    )
     statistics: SlickStatistics
     slicks: List[SlickGeometry]
     #: Look-alike (Class 2) polygons isolated from true oil spills; logged as
@@ -699,6 +708,8 @@ class AttributionResponse(BaseModel):
         default_factory=list,
         description="SAR-detected ships near the slick with no AIS match.",
     )
+    #: Warnings from the attribution stage (e.g., zero AIS candidates in envelope).
+    warnings: List[str] = Field(default_factory=list)
     attribution_geojson: Dict[str, Any] = Field(default_factory=dict)
     artifact_paths: Dict[str, str] = Field(default_factory=dict)
 
@@ -756,9 +767,15 @@ class PipelineOptions(DetectionOptions):
 
     # -- end-to-end controls --------------------------------------------------
     fetch_live_metocean: bool = Field(
-        False,
+        True,
         description="When true, download live Copernicus currents + ERA5 winds "
         "centered on the primary slick before drift (degrades gracefully on failure).",
+    )
+    strict_metocean: bool = Field(
+        False,
+        description="When true, reject config_fallback metocean with HTTP 502 "
+        "instead of running drift on static constants. Requires live fetch or "
+        "readable NetCDF files.",
     )
     generate_briefing: bool = Field(
         False,
@@ -959,6 +976,9 @@ class ModelInfo(BaseModel):
     load_duration_ms: float = 0.0
     parameters: int = 0
     error: Optional[str] = None
+    val_oil_iou: Optional[float] = Field(
+        None, description="Best validation Oil Spill IoU recorded at training time."
+    )
 
 
 class HealthResponse(BaseModel):

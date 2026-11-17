@@ -11,7 +11,6 @@ The pipeline stage manages the chaining and degradation logic:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -62,7 +61,7 @@ def _milliseconds(started: float) -> float:
     return round((time.perf_counter() - started) * 1000.0, 2)
 
 
-async def _resolve_incident_metocean_async(
+def _resolve_incident_meteocean_sync(
     *,
     slicks: list[dict[str, Any]],
     scene_timestamp_utc: str | None,
@@ -92,24 +91,15 @@ async def _resolve_incident_metocean_async(
     out_dir = Path("results/api") / rid / "metocean"
 
     try:
-        paths = await asyncio.wait_for(
-            asyncio.to_thread(
-                fetch_incident_metocean,
-                lon=float(lon),
-                lat=float(lat),
-                detection_time_utc=acq_time,
-                hindcast_hours=int(hindcast_hours),
-                forecast_hours=int(forecast_hours),
-                out_dir=str(out_dir),
-            ),
-            timeout=timeout_sec,
+        paths = fetch_incident_metocean(
+            lon=float(lon),
+            lat=float(lat),
+            detection_time_utc=acq_time,
+            hindcast_hours=int(hindcast_hours),
+            forecast_hours=int(forecast_hours),
+            out_dir=str(out_dir),
         )
         return paths, warnings
-    except asyncio.TimeoutError:
-        msg = f"Live metocean fetch timed out after {timeout_sec}s; degrading to config_fallback."
-        logger.warning(msg)
-        warnings.append(msg)
-        return None, warnings
     except Exception as exc:  # noqa: BLE001
         msg = f"Live metocean fetch failed ({type(exc).__name__}: {exc}); degrading to config_fallback."
         logger.warning(msg)
@@ -275,15 +265,13 @@ class PipelineService:
         # --- PRE-DRIFT: LIVE METOCEAN FETCH (WITH GRACEFUL FALLBACK) ---
         metocean_override: Optional[Dict[str, str]] = None
         if options.fetch_live_metocean and slicks:
-            metocean_override, metocean_warnings = asyncio.run(
-                _resolve_incident_metocean_async(
-                    slicks=[s.model_dump(mode="json") for s in slicks],
-                    scene_timestamp_utc=seed.acquisition_utc,
-                    hindcast_hours=self._hindcast_hours(options),
-                    forecast_hours=self._forecast_hours(options),
-                    request_id=getattr(response, "request_id", "") or "",
-                    timeout_sec=self.settings.metocean.fetch_timeout_sec,
-                )
+            metocean_override, metocean_warnings = _resolve_incident_meteocean_sync(
+                slicks=[s.model_dump(mode="json") for s in slicks],
+                scene_timestamp_utc=seed.acquisition_utc,
+                hindcast_hours=self._hindcast_hours(options),
+                forecast_hours=self._forecast_hours(options),
+                request_id=getattr(response, "request_id", "") or "",
+                timeout_sec=self.settings.metocean.fetch_timeout_sec,
             )
             warnings.extend(metocean_warnings)
 
@@ -293,7 +281,10 @@ class PipelineService:
         drift_response: Optional[DriftResponse] = None
         origin_source = ORIGIN_FROM_SLICK
         if options.run_drift:
-            drift_response, drift_stage = self._run_drift(options, seed, metocean_paths=metocean_override)
+            drift_response, drift_stage = self._run_drift(
+                options, seed, metocean_paths=metocean_override,
+                strict_metocean=options.strict_metocean,
+            )
             stages.append(drift_stage)
             if drift_response is not None:
                 warnings.extend(drift_response.warnings)
@@ -313,7 +304,8 @@ class PipelineService:
         forecast_response: Optional[DriftResponse] = None
         if options.run_forecast:
             forecast_response, forecast_stage = self._run_forecast(
-                options, seed, metocean_paths=metocean_override
+                options, seed, metocean_paths=metocean_override,
+                strict_metocean=options.strict_metocean,
             )
             stages.append(forecast_stage)
             if forecast_response is not None:
@@ -378,12 +370,15 @@ class PipelineService:
         seed: DriftSeed,
         *,
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> Tuple[Optional[DriftResponse], PipelineStageReport]:
         """Hindcast the slick back to its discharge point."""
         started = time.perf_counter()
         try:
             request = self._drift_request(options, seed, self._hindcast_hours(options))
-            drift_response = self.drift.run_hindcast(request, metocean_paths=metocean_paths)
+            drift_response = self.drift.run_hindcast(
+                request, metocean_paths=metocean_paths, strict_metocean=strict_metocean
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Pipeline drift hindcast stage failed")
             return None, PipelineStageReport(
@@ -409,6 +404,7 @@ class PipelineService:
         seed: DriftSeed,
         *,
         metocean_paths: Optional[Dict[str, str]] = None,
+        strict_metocean: bool = False,
     ) -> Tuple[Optional[DriftResponse], PipelineStageReport]:
         """Project forward trajectories from current observation."""
         started = time.perf_counter()
@@ -416,7 +412,9 @@ class PipelineService:
             request = self._drift_request(
                 options, seed, self._forecast_hours(options)
             )
-            forecast_response = self.drift.run_forecast(request, metocean_paths=metocean_paths)
+            forecast_response = self.drift.run_forecast(
+                request, metocean_paths=metocean_paths, strict_metocean=strict_metocean
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Pipeline drift forecast stage failed")
             return None, PipelineStageReport(
