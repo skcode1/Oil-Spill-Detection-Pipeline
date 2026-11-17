@@ -16,18 +16,21 @@ paths:
   culprit_geojson: "results/culprit_vessel.geojson"
 
 model:
-  architecture: "unet"
+  architecture: "deeplabv3plus"
   encoder: "resnet34"
-  encoder_weights: null
-  in_channels: 3                    # [VV, VH, VV+VH composite] — model expects 3-channel input
-  classes: 3                        # Background / No-Oil (0), Oil Spill (1), Lookalike (2)
-  class_names: ["background", "oil_spill", "lookalike"]
+  encoder_weights: "imagenet"
+  in_channels: 3                    # [VV, VH, VV/VH ratio] — model expects 3-channel SAR composite
+  classes: 5                        # 0: Sea Surface, 1: Oil Spill, 2: Look-Alike, 3: Ship, 4: Land
+  class_names: ["sea_surface", "oil_spill", "look_alike", "ship", "land"]
   oil_class_index: 1
   lookalike_class_index: 2
+  ship_class_index: 3
+  land_class_index: 4
   background_class_index: 0
-  input_size: [256, 256]
-  # 0.90 is the operating point that keeps no-oil scenes free of false
-  # slicks with the current checkpoint (see README "Threshold calibration").
+  input_size: [512, 512]
+  # 0.90 operating point keeps no-oil scenes free of false slicks with the
+  # current 3-class checkpoint; retune to ~0.50 once a 5-class checkpoint is
+  # trained on the Krestenitis SAR dataset.
   confidence_threshold: 0.90
 
 inference:
@@ -47,6 +50,9 @@ inference:
   contour_epsilon_fraction: 0.005  # approxPolyDP epsilon as fraction of perimeter; OILSPILL_CONTOUR_EPSILON wins
   save_artifacts: true
   preview_max_edge: 512
+  # 5-class post-processing thresholds
+  min_slick_area_km2: 0.05      # drop oil polygons smaller than this (km^2)
+  ship_buffer_km: 2.0           # buffer around oil slicks to flag co-located SAR ships
 
 # Post-processing lookalike filtering: geometric, textural, and contextual
 # heuristics to distinguish true petroleum discharges from false-positive
@@ -157,15 +163,13 @@ metocean:
   #    wind_drift_factor: 0.032}
   # The file shipped in data/processed/ holds the synthetic scenario's constants, so
   # it reproduces the fallback vectors exactly; replace it with real Copernicus/ERA5
-  # samples (metocean.datasets + src/environment_fetcher.py) for operational runs.
+  # samples (metocean.datasets + app/services/environment_fetcher.py) for operational runs.
   # Override the path with OILSPILL_METOCEAN_JSON, or set it empty to disable.
   environment_json: "data/processed/metocean_environment.json"
-  # Incident-specific dataset templates (src/environment_fetcher.py);
-  # {min_lat} {max_lat} {min_lon} {max_lon} {start} {end} placeholders,
-  # plus strftime forms such as {start:%Y-%m-%d}.
-  datasets:
-    copernicus_currents: "https://nrt.cmems-du.eu/thredds/dodsC/global-analysis-forecast-phy-001-024?uo[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
-    era5_wind: "https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis/surface/uwnd.sig995.nc?uwnd[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
+  # Request-scoped live metocean fetch (Copernicus currents + ERA5 winds) controls.
+  fetch_timeout_sec: 25.0       # wall-time cap for live Copernicus/ERA5 downloads per request
+  current_nc: "data/processed/current.nc"
+  wind_nc: "data/processed/wind.nc"
 
 # Synthetic AIS/metocan scenario generator (src/simulation_generator.py):
 # produce MarineCadastre-style feeds for ANY region, time window and fleet.
@@ -276,3 +280,16 @@ api:
     Detection of oil slicks in satellite imagery, Lagrangian drift
     (backtracing and forecasting) and AIS candidate pruning with
     explainable vessel attribution scoring.
+
+# Optional LLM synthesis layer (Stage 4).  Google Gemini 2.5 Flash converts the
+# deterministic dossier JSON into an NTRO intelligence narrative.  The stage is
+# strictly downstream of attribution and never blocks the evidence dossier:
+# when GEMINI_API_KEY is unset or the call fails, briefing reports "skipped".
+briefing:
+  enabled: true
+  model: "gemini-2.5-flash"
+  temperature: 0.1
+  timeout_sec: 30.0
+  # Override with OILSPILL_GEMINI_API_KEY.  When unset, generate_briefing is
+  # silently skipped and the dossier omits the narrative.
+  api_key_env: "GEMINI_API_KEY"

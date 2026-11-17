@@ -40,6 +40,7 @@ from app.schemas import (
 )
 from app.services import (
     AttributionService,
+    BriefingService,
     DetectionService,
     DriftService,
     PipelineService,
@@ -72,6 +73,7 @@ class AppServices:
     detection: DetectionService
     drift: DriftService
     attribution: AttributionService
+    briefing: BriefingService
     pipeline: PipelineService
     started_at_perf: float = field(default_factory=time.perf_counter)
     started_at_utc: str = field(default_factory=utc_iso)
@@ -125,10 +127,12 @@ def build_services(
     detection = DetectionService(resolved, model)
     drift = DriftService(resolved)
     attribution = AttributionService(resolved)
+    briefing = BriefingService(resolved)
     logger.info(
         "Services ready (drift engine chosen per request: auto/lagrangian/opendrift; "
-        "default AIS source: %s)",
+        "default AIS source: %s; briefing enabled=%s)",
         resolved.ais_csv or "none",
+        resolved.briefing.enabled,
     )
 
     return AppServices(
@@ -137,7 +141,8 @@ def build_services(
         detection=detection,
         drift=drift,
         attribution=attribution,
-        pipeline=PipelineService(resolved, detection, drift, attribution),
+        briefing=briefing,
+        pipeline=PipelineService(resolved, detection, drift, attribution, briefing),
     )
 
 
@@ -384,6 +389,13 @@ def get_attribution_service(
 ) -> AttributionService:
     """AIS vessel-attribution service."""
     return services.attribution
+
+
+def get_briefing_service(
+    services: AppServices = Depends(get_services),
+) -> BriefingService:
+    """Optional Gemini briefing service (never blocks the pipeline)."""
+    return services.briefing
 
 
 def get_pipeline_service(

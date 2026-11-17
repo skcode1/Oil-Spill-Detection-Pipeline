@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import segmentation_models_pytorch as smp
 import torch
 
 from app.config import AppSettings
@@ -35,7 +36,7 @@ from app.errors import ModelNotReadyError
 from app.schemas import ModelInfo
 
 # Reuse the canonical, already-validated helpers from the existing codebase.
-from src.detect_and_vectorize import load_trained_model, sar_to_three_channel, _scene_normalise
+from src.detect_and_vectorize import _scene_normalise, load_trained_model, sar_to_three_channel
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ class InferenceResult:
     oil_confidence: np.ndarray
     lookalike_confidence: np.ndarray
     background_confidence: np.ndarray
+    ship_confidence: np.ndarray
+    land_confidence: np.ndarray
     warnings: List[str] = field(default_factory=list)
 
 
@@ -104,6 +107,25 @@ class SpillSegmentationModel:
             self.log.warning("Invalid device %r (%s); using CPU.", requested, exc)
             return torch.device("cpu")
 
+    @staticmethod
+    def _detect_architecture(state_dict: Dict[str, torch.Tensor]) -> Optional[str]:
+        """Infer the saved architecture from checkpoint state-dict keys.
+
+        Returns ``'deeplabv3plus'`` when DeepLabV3Plus head/ASPP keys are present,
+        ``'unet'`` when U-Net decoder/head keys are present, or ``None`` when the
+        architecture cannot be determined.
+        """
+        keys = set(state_dict.keys())
+        if any(k.startswith("decoder.aspp") for k in keys):
+            return "deeplabv3plus"
+        if any(k.startswith("decoder.blocks") for k in keys):
+            return "unet"
+        if any(k.startswith("segmentation_head.0") for k in keys):
+            return "deeplabv3plus"
+        if any(k.startswith("segmentation_head.conv") for k in keys):
+            return "unet"
+        return None
+
     def _normalisation_stats(self) -> Tuple[List[float], List[float]]:
         """Per-channel normalisation statistics (config.yaml -> augmentation)."""
         augmentation = self.settings.config.get("augmentation") or {}
@@ -142,13 +164,70 @@ class SpillSegmentationModel:
             self._device = self._resolve_device()
             started = time.perf_counter()
             try:
-                model = load_trained_model(
-                    str(checkpoint),
-                    self._device,
-                    num_classes=self.settings.model.classes,
-                    in_channels=self.settings.model.in_channels,
-                    encoder_name=self.settings.model.encoder,
+                # Load the raw checkpoint first so we can detect the architecture
+                # it was saved for (3-class U-Net vs 5-class DeepLabV3Plus).  This
+                # keeps the existing production checkpoint working while also
+                # supporting the new 5-class DeepLabV3Plus checkpoints.
+                checkpoint_state = torch.load(
+                    str(checkpoint), map_location="cpu", weights_only=True
                 )
+                state_dict = None
+                if isinstance(checkpoint_state, dict):
+                    state_dict = (
+                        checkpoint_state.get("model_state_dict")
+                        or checkpoint_state.get("state_dict")
+                        or checkpoint_state
+                    )
+                else:
+                    state_dict = checkpoint_state
+
+                detected_arch = self._detect_architecture(state_dict)
+                requested_arch = str(self.settings.model.architecture).lower()
+                if detected_arch:
+                    architecture = detected_arch
+                    self.log.info(
+                        "Checkpoint architecture detected as %s (requested: %s)",
+                        architecture,
+                        requested_arch,
+                    )
+                else:
+                    architecture = requested_arch
+                    self.log.info(
+                        "No architecture metadata in checkpoint; using requested %s",
+                        architecture,
+                    )
+
+                num_classes = int(self.settings.model.classes)
+                ckpt_classes = None
+                if isinstance(checkpoint_state, dict) and "num_classes" in checkpoint_state:
+                    ckpt_classes = int(checkpoint_state["num_classes"])
+                if ckpt_classes is None and isinstance(state_dict, dict):
+                    head_weight = state_dict.get("segmentation_head.0.weight")
+                    if head_weight is not None:
+                        ckpt_classes = int(head_weight.shape[0])
+                if ckpt_classes:
+                    num_classes = ckpt_classes
+                    self.log.info(
+                        "Inferred %d classes from checkpoint segmentation head.", num_classes
+                    )
+
+                if architecture == "deeplabv3plus":
+                    model = smp.DeepLabV3Plus(
+                        encoder_name=self.settings.model.encoder,
+                        encoder_weights=None,
+                        in_channels=int(self.settings.model.in_channels),
+                        classes=num_classes,
+                    )
+                else:
+                    model = load_trained_model(
+                        str(checkpoint),
+                        self._device,
+                        num_classes=num_classes,
+                        in_channels=self.settings.model.in_channels,
+                        encoder_name=self.settings.model.encoder,
+                    )
+
+                model.load_state_dict(state_dict, strict=False)
                 model.eval()
                 for parameter in model.parameters():
                     parameter.requires_grad_(False)
@@ -173,10 +252,10 @@ class SpillSegmentationModel:
             self._loaded_at = datetime.now(timezone.utc).isoformat()
             self._checkpoint_size_bytes = int(checkpoint.stat().st_size)
             self._resolved = {
-                "architecture": self.settings.model.architecture,
+                "architecture": architecture,
                 "encoder": self.settings.model.encoder,
                 "in_channels": self.settings.model.in_channels,
-                "num_classes": self.settings.model.classes,
+                "num_classes": num_classes,
                 "parameters": int(sum(p.numel() for p in model.parameters())),
             }
             info = self.info()
@@ -360,18 +439,24 @@ class SpillSegmentationModel:
             duration_ms = (time.perf_counter() - started) * 1000.0
 
             model_cfg = self.settings.model
+            num_classes = int(
+                self._resolved.get("num_classes", model_cfg.classes)
+            )
             oil_index = min(max(model_cfg.oil_class_index, 0), num_classes - 1)
             lookalike_index = min(max(model_cfg.lookalike_class_index, 0), num_classes - 1)
             background_index = min(max(model_cfg.background_class_index, 0), num_classes - 1)
+            ship_index = min(max(getattr(model_cfg, "ship_class_index", 3), 0), num_classes - 1)
+            land_index = min(max(getattr(model_cfg, "land_class_index", 4), 0), num_classes - 1)
 
             self.log.info(
-                "Inference complete | %dx%d | tiles=%d | tile=%d stride=%d batch=%d | %.0fms",
+                "Inference complete | %dx%d | tiles=%d | tile=%d stride=%d batch=%d | classes=%d | %.0fms",
                 width,
                 height,
                 len(origins),
                 tile_h,
                 step,
                 batch_size,
+                num_classes,
                 duration_ms,
             )
             return InferenceResult(
@@ -382,5 +467,7 @@ class SpillSegmentationModel:
                 oil_confidence=prob_avg[oil_index],
                 lookalike_confidence=prob_avg[lookalike_index],
                 background_confidence=prob_avg[background_index],
+                ship_confidence=prob_avg[ship_index],
+                land_confidence=prob_avg[land_index],
             )
 

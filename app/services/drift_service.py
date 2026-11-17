@@ -34,6 +34,7 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -519,33 +520,57 @@ def parse_time(raw: str) -> datetime:
 
 
 class DriftService:
-    """Route drift requests to OpenDrift or the built-in Lagrangian engine."""
+    """Route drift requests to OpenDrift or the built-in Lagrangian engine.
+
+    Metocean forcing is resolved in strict priority order:
+      1. ``request``   - inline samples supplied in the API payload
+      2. ``netcdf``    - per-request override (``metocean_paths``) or the
+                         config ``current_nc``/``wind_nc`` (OpenDrift only)
+      3. ``environment_json`` - per-incident JSON manifest
+      4. ``config_fallback`` - static config.yaml constants
+    """
 
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
         self.lagrangian = LagrangianDriftEngine(settings)
 
     # ----------------------------------------------------------- public entry
-    def run_hindcast(self, request: DriftRequest) -> DriftResponse:
+    def run_hindcast(
+        self,
+        request: DriftRequest,
+        *,
+        metocean_paths: Optional[Dict[str, str]] = None,
+    ) -> DriftResponse:
         """Trace a slick backwards from sensing time to its likely origin."""
-        return self._run(request, direction="backward")
+        return self._run(request, direction="backward", metocean_paths=metocean_paths)
 
-    def run_forecast(self, request: DriftRequest) -> DriftResponse:
+    def run_forecast(
+        self,
+        request: DriftRequest,
+        *,
+        metocean_paths: Optional[Dict[str, str]] = None,
+    ) -> DriftResponse:
         """Propagate a release forward to predict the future slick extent."""
-        return self._run(request, direction="forward")
+        return self._run(request, direction="forward", metocean_paths=metocean_paths)
 
-    def _run(self, request: DriftRequest, *, direction: str) -> DriftResponse:
+    def _run(
+        self,
+        request: DriftRequest,
+        *,
+        direction: str,
+        metocean_paths: Optional[Dict[str, str]] = None,
+    ) -> DriftResponse:
         warnings: List[str] = []
         start = parse_time(request.start_time_utc)
         wind_drift_factor, diffusivity, confidence = self._physics(request)
-        field = self._resolve_field(request, start, warnings)
+        field = self._resolve_field(request, start, warnings, metocean_paths=metocean_paths)
         if field.wind_drift_factor is not None and request.wind_drift_factor is None:
             wind_drift_factor = field.wind_drift_factor
             warnings.append(
                 f"Wind drift factor {wind_drift_factor:.4f} came from the metocean "
                 "field instead of the configured value."
             )
-        engine = self._resolve_engine(request, direction, warnings)
+        engine = self._resolve_engine(request, direction, warnings, metocean_paths=metocean_paths)
 
         if engine == "opendrift":
             try:
@@ -557,6 +582,7 @@ class DriftService:
                     diffusivity=diffusivity,
                     confidence=confidence,
                     warnings=warnings,
+                    metocean_paths=metocean_paths,
                 )
             except DriftEngineError:
                 if request.engine == "opendrift":
@@ -592,19 +618,22 @@ class DriftService:
         )
 
     def _resolve_field(
-        self, request: DriftRequest, start: datetime, warnings: List[str]
+        self,
+        request: DriftRequest,
+        start: datetime,
+        warnings: List[str],
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> MetoceanField:
-        """Build the metocean field, warning about clamping or fallback usage.
+        """Build the metocean field for the Lagrangian engine.
 
-        Precedence: samples supplied in the request, then the configured
-        per-incident manifest (``metocean.environment_json``), then the config
-        fallback constants - most specific source first.
+        Precedence: request samples -> per-incident JSON manifest (metocean_paths
+        override, then configured manifest) -> config fallback constants.
         """
         if request.metocean:
             field = MetoceanField.from_samples(request.metocean, default_time=start)
             self._warn_coverage(field, request.duration_hours, warnings)
             return field
-        field = self._environment_field(request, start, warnings)
+        field = self._environment_field(request, start, warnings, metocean_paths=metocean_paths)
         if field is not None:
             return field
         defaults = self.settings.metocean
@@ -617,19 +646,28 @@ class DriftService:
         return MetoceanField.uniform(defaults.fallback_sample())
 
     def _environment_field(
-        self, request: DriftRequest, start: datetime, warnings: List[str]
+        self,
+        request: DriftRequest,
+        start: datetime,
+        warnings: List[str],
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> Optional[MetoceanField]:
-        """Field from the configured JSON manifest, or ``None`` when unusable.
+        """Field from the per-incident JSON manifest, or ``None`` when unusable.
 
-        A broken manifest never fails a request: it is reported as a warning and
-        the run continues on the config fallback, because the alternative -
-        rejecting every drift request because one cached file is malformed - is
-        worse for an operational pipeline.
+        Resolution order: metocean_paths.environment_json (per-request override from
+        the live fetch), OILSPILL_METOCEAN_JSON env var, config
+        ``metocean.environment_json``.  A broken manifest never fails a request.
         """
-        manifest = self.settings.metocean.environment_json
-        if not manifest:
+        overrides = metocean_paths or {}
+        manifest_str = overrides.get("environment_json")
+        if manifest_str is None:
+            manifest_str = os.getenv("OILSPILL_METOCEAN_JSON")
+        if manifest_str is None:
+            manifest = self.settings.metocean.environment_json
+            manifest_str = str(manifest) if manifest else None
+        if not manifest_str:
             return None
-        path = self._resolve_data_path(str(manifest))
+        path = self._resolve_data_path(manifest_str)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -649,7 +687,7 @@ class DriftService:
         try:
             field = MetoceanField.from_environment_json(payload, default_time=start)
         except (InvalidInputError, TypeError, ValueError) as exc:
-            reason = " ".join(str(exc).split())  # Pydantic reports span several lines
+            reason = " ".join(str(exc).split())
             logger.warning("Metocean manifest %s is invalid: %s", path, reason)
             warnings.append(
                 f"Metocean manifest {path} is invalid ({reason}); the config fallback "
@@ -692,18 +730,32 @@ class DriftService:
             )
 
     def _resolve_engine(
-        self, request: DriftRequest, direction: str, warnings: List[str]
+        self,
+        request: DriftRequest,
+        direction: str,
+        warnings: List[str],
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> str:
-        """Pick ``'opendrift'`` or ``'lagrangian'`` for this request."""
-        readers = [request.current_nc, request.wind_nc]
-        readable = all(path and self._resolve_data_path(path).is_file() for path in readers)
+        """Pick ``'opendrift'`` or ``'lagrangian'`` for this request.
+
+        NetCDF forcing comes from ``metocean_paths`` (per-request override from the
+        live fetch) when supplied, otherwise from ``request.current_nc``/``wind_nc``,
+        otherwise the configured config.yaml paths.
+        """
+        overrides = metocean_paths or {}
+        cur_nc = overrides.get("current_nc") or request.current_nc
+        wnd_nc = overrides.get("wind_nc") or request.wind_nc
+        readable = all(
+            path and self._resolve_data_path(path).is_file()
+            for path in (cur_nc, wnd_nc)
+        )
         if request.engine == "lagrangian":
             return "lagrangian"
         if request.engine == "opendrift":
             if not readable:
                 raise DriftEngineError(
                     "OpenDrift requested but metocean files are not readable",
-                    details={"current_nc": request.current_nc, "wind_nc": request.wind_nc},
+                    details={"current_nc": cur_nc, "wind_nc": wnd_nc},
                 )
             if direction == "backward" and request.source.slick_geojson is None:
                 raise DriftEngineError(
@@ -714,7 +766,7 @@ class DriftService:
             return "opendrift"
         if readable and direction == "backward" and request.source.slick_geojson is not None:
             return "opendrift"
-        if any(readers):
+        if any((cur_nc, wnd_nc)):
             warnings.append(
                 "Configured NetCDF metocean files were not usable; the built-in "
                 "Lagrangian engine was used instead."
@@ -843,6 +895,7 @@ class DriftService:
         diffusivity: float,
         confidence: float,
         warnings: List[str],
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> DriftResponse:
         """Delegate to ``src/opendrift_engine.OpenDriftHindcastEngine``."""
         try:
@@ -852,13 +905,17 @@ class DriftService:
                 f"OpenDrift engine is unavailable in this environment: {exc}"
             ) from exc
 
+        overrides = metocean_paths or {}
+        current_nc = overrides.get("current_nc") or request.current_nc
+        wind_nc = overrides.get("wind_nc") or request.wind_nc
+
         seed_path, seed_lon, seed_lat = self._write_seed_geojson(request)
         output_dir = self.settings.artifact_dir / "opendrift"
         weathering_notes: List[str] = []
         try:
             engine = OpenDriftHindcastEngine(
-                current_data_path=str(self._resolve_data_path(str(request.current_nc))),
-                wind_data_path=str(self._resolve_data_path(str(request.wind_nc))),
+                current_data_path=str(self._resolve_data_path(str(current_nc))),
+                wind_data_path=str(self._resolve_data_path(str(wind_nc))),
                 wave_data_path=(
                     str(self._resolve_data_path(request.wave_nc)) if request.wave_nc else None
                 ),

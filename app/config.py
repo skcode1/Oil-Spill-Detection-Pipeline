@@ -132,16 +132,18 @@ class ModelSettings:
     """Architecture and class-label contract of the trained checkpoint."""
 
     encoder: str = "resnet34"
-    architecture: str = "unet"
+    architecture: str = "deeplabv3plus"
     in_channels: int = 3
-    classes: int = 3
+    classes: int = 5
     class_names: List[str] = field(
-        default_factory=lambda: ["background", "oil_spill", "lookalike"]
+        default_factory=lambda: ["sea_surface", "oil_spill", "look_alike", "ship", "land"]
     )
     background_class_index: int = 0
     oil_class_index: int = 1
     lookalike_class_index: int = 2
-    input_size: List[int] = field(default_factory=lambda: [256, 256])
+    ship_class_index: int = 3
+    land_class_index: int = 4
+    input_size: List[int] = field(default_factory=lambda: [512, 512])
     confidence_threshold: float = 0.50
 
     @property
@@ -198,6 +200,9 @@ class InferenceSettings:
     preview_max_edge: int = 512
     #: Highest confidence threshold accepted from a request.
     confidence_bound: float = 1.0
+    #: 5-class post-processing thresholds (config.yaml -> inference).
+    min_slick_area_km2: float = 0.05
+    ship_buffer_km: float = 2.0
 
     def effective_stride(self) -> int:
         """Stride actually usable for the configured tile size."""
@@ -312,6 +317,11 @@ class MetoceanSettings:
     max_endpoint_samples: int = 200
     #: Seed-region dilation (degrees) used when the source degenerates to a point.
     point_seed_buffer_deg: float = 0.01
+    #: Live metocean fetch controls (Copernicus currents + ERA5 winds).
+    fetch_timeout_sec: float = 25.0
+    #: Server-side NetCDF forcing paths used by OpenDrift when live fetch is off.
+    current_nc: Optional[Path] = None
+    wind_nc: Optional[Path] = None
 
     def fallback_sample(self) -> Dict[str, float]:
         """Uniform fallback metocean sample (u/v current and wind, m/s)."""
@@ -321,6 +331,18 @@ class MetoceanSettings:
             "u_wind_mps": self.fallback_wind_u_mps,
             "v_wind_mps": self.fallback_wind_v_mps,
         }
+
+
+@dataclass(frozen=True)
+class BriefingSettings:
+    """Optional LLM synthesis layer (Gemini 2.5 Flash) for dossier narration."""
+
+    enabled: bool = True
+    model: str = "gemini-2.5-flash"
+    temperature: float = 0.1
+    timeout_sec: float = 30.0
+    #: Environment variable carrying the Gemini API key.
+    api_key_env: str = "GEMINI_API_KEY"
 
 
 @dataclass(frozen=True)
@@ -392,6 +414,7 @@ class AppSettings:
     metocean: MetoceanSettings
     ais: AisSettings
     server: ServerSettings
+    briefing: BriefingSettings = field(default_factory=BriefingSettings)
     attribution: Dict[str, Any] = field(default_factory=dict)
     regions: List[Dict[str, Any]] = field(default_factory=list)
     validation: Dict[str, Any] = field(default_factory=dict)
@@ -555,13 +578,14 @@ def load_settings(
     api_cfg = _as_dict(config.get("api"))
     backend_cfg = _as_dict(config.get("backend"))
     attribution_cfg = _as_dict(config.get("attribution"))
+    briefing_cfg = _as_dict(config.get("briefing"))
 
     class_names = list(
         model_cfg.get("class_names") or ["background", "oil_spill", "lookalike"]
     )
 
     model = ModelSettings(
-        architecture=str(model_cfg.get("architecture", "unet")),
+        architecture=str(model_cfg.get("architecture", "deeplabv3plus")),
         encoder=str(model_cfg.get("encoder", "resnet34")),
         in_channels=int(model_cfg.get("in_channels", 3)),
         classes=int(model_cfg.get("classes", len(class_names))),
@@ -569,7 +593,9 @@ def load_settings(
         background_class_index=int(model_cfg.get("background_class_index", 0)),
         oil_class_index=int(model_cfg.get("oil_class_index", 1)),
         lookalike_class_index=int(model_cfg.get("lookalike_class_index", 2)),
-        input_size=[int(v) for v in (model_cfg.get("input_size") or [256, 256])],
+        ship_class_index=int(model_cfg.get("ship_class_index", 3)),
+        land_class_index=int(model_cfg.get("land_class_index", 4)),
+        input_size=[int(v) for v in (model_cfg.get("input_size") or [512, 512])],
         confidence_threshold=float(model_cfg.get("confidence_threshold", 0.5)),
     )
 
@@ -597,6 +623,8 @@ def load_settings(
         ),
         save_artifacts=bool(inference_cfg.get("save_artifacts", True)),
         preview_max_edge=int(inference_cfg.get("preview_max_edge", 512)),
+        min_slick_area_km2=float(inference_cfg.get("min_slick_area_km2", 0.05)),
+        ship_buffer_km=float(inference_cfg.get("ship_buffer_km", 2.0)),
     )
     inference.validate()
 
@@ -696,6 +724,16 @@ def load_settings(
                 "point_seed_buffer_deg", metocean_cfg.get("release_seed_buffer_deg", 0.01)
             )
         ),
+        fetch_timeout_sec=_env_float(
+            "OILSPILL_METOCEAN_FETCH_TIMEOUT_SEC",
+            float(metocean_cfg.get("fetch_timeout_sec", 25.0)),
+        ),
+        current_nc=_optional_path(
+            metocean_cfg.get("current_nc"), root
+        ),
+        wind_nc=_optional_path(
+            metocean_cfg.get("wind_nc"), root
+        ),
         environment_json=_optional_path(
             _env_str("OILSPILL_METOCEAN_JSON") or metocean_cfg.get("environment_json"), root
         ),
@@ -712,6 +750,17 @@ def load_settings(
         default_csv=_optional_path(
             _env_str("OILSPILL_AIS_DEFAULT_CSV") or ais_cfg.get("default_csv"), root
         ),
+    )
+
+    briefing = BriefingSettings(
+        enabled=bool(briefing_cfg.get("enabled", True)),
+        model=str(briefing_cfg.get("model", "gemini-2.5-flash")),
+        temperature=float(briefing_cfg.get("temperature", 0.1)),
+        timeout_sec=_env_float(
+            "OILSPILL_BRIEFING_TIMEOUT_SEC",
+            float(briefing_cfg.get("timeout_sec", 30.0)),
+        ),
+        api_key_env=str(briefing_cfg.get("api_key_env", "GEMINI_API_KEY")),
     )
 
     cors_raw = api_cfg.get("cors_origins")
@@ -769,6 +818,7 @@ def load_settings(
         lookalike_filter=lookalike_filter,
         metocean=metocean,
         ais=ais,
+        briefing=briefing,
         server=server,
         attribution=attribution_cfg,
         regions=list(config.get("regions") or []),

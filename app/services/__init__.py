@@ -28,6 +28,7 @@ from app.services.attribution_service import (
     load_pruner,
     load_scorer,
 )
+from app.services.briefing_service import BriefingService
 from app.services.detection_service import DetectionOutcome, DetectionService
 from app.services.drift_service import DriftService
 from app.services.model_service import InferenceResult, SpillSegmentationModel
@@ -35,6 +36,7 @@ from app.services.pipeline_service import PipelineService
 
 __all__ = [
     "AttributionService",
+    "BriefingService",
     "DetectionOutcome",
     "DetectionService",
     "DriftService",

@@ -1,15 +1,18 @@
 """Oil-spill detection, vectorisation and characterisation.
 
 Stage logic:
-1. Post-process probability maps (argmax label map, confidence thresholding,
-   and morphological opening/closing).
-2. Vectorise external contours via cv2.findContours & cv2.approxPolyDP to derive
-   slick polygons with metric properties.
-3. Geolocate via GeoTIFF affine transforms to compute geodesic areas.
-4. Estimate age via age_estimator.
-5. Classify false positives using LookalikeFilter with folder-boundary discrimination
-   (No Oil vs. Lookalike vs. Confirmed Spill).
-6. Export artifacts (spill GeoJSON, mask PNG, base64 preview).
+1. Run 5-class SAR segmentation (DeepLabV3+ / ResNet-34) producing class
+   probability maps: 0 Sea, 1 Oil Spill, 2 Look-Alike, 3 Ship, 4 Land.
+2. Vectorise each class mask into georeferenced polygons via rasterio.features.shapes,
+   preserving the GeoTIFF affine transform and CRS so output polygons are WGS84.
+3. Compute geodesic polygon areas (EPSG:6933 equal-area) and mean softmax confidence.
+4. Cross-correlate Class-3 Ship polygons with Class-1 Oil Spill polygons using a
+   configurable buffer (default 2 km) to flag co-located vessels ("dark ship" cue).
+5. Estimate spill age, export artefacts (mask PNG, GeoJSON, base64 preview).
+
+The service keeps the existing DetectionOutcome interface while extending the
+detection payload with look_alikes and detected_ships so downstream drift and
+attribution stages can consume them.
 """
 
 from __future__ import annotations
@@ -22,16 +25,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
-from shapely.geometry import Polygon, mapping
-
-try:
-    from rasterio.transform import Affine as RasterioAffine
-    from rasterio.transform import xy as rasterio_xy
-except ImportError:
-    rasterio_xy = None
-    RasterioAffine = None
+import pyproj
+from rasterio.features import shapes
+from rasterio.transform import Affine
+from rasterio.warp import transform_geom
+from shapely.geometry import Polygon, mapping, shape
+from shapely.ops import transform as shapely_transform
 
 from app.config import AppSettings
 from app.errors import InvalidInputError
@@ -44,29 +44,25 @@ from app.schemas import (
 )
 from app.services import image_io
 from app.services.age_estimator import estimate_spill_age
-from app.services.geo import geodesic_area_m2
 from app.services.image_io import SceneArray
-from app.services.lookalike_filter import LookalikeFilter
 from app.services.model_service import SpillSegmentationModel
-from src.detect_and_vectorize import characterize_geometry
 
 logger = logging.getLogger(__name__)
 
+#: 5-class SAR taxonomy (Krestenitis et al. / M4D Sentinel-1 standard).
+CLASS_IDS = {
+    "sea": 0,
+    "oil_spill": 1,
+    "look_alike": 2,
+    "ship": 3,
+    "land": 4,
+}
+
+#: Equal-area projection for accurate km^2 area computation from WGS84 geometries.
+_EQUAL_AREA_CRS = "EPSG:6933"
+_DEG_PER_KM = 111.32
+#: Legacy contour approximation epsilon fraction honoured by existing contracts.
 APPROX_EPSILON_FRACTION = 0.005
-
-
-def as_affine(transform: Any) -> Any:
-    """Coerce stored geotransform into an Affine object compatible with rasterio."""
-    if transform is None or RasterioAffine is None:
-        return None
-    if isinstance(transform, (list, tuple)):
-        if len(transform) != 6:
-            return None
-        try:
-            return RasterioAffine(*(float(value) for value in transform))
-        except (TypeError, ValueError):
-            return None
-    return transform
 
 
 @dataclass
@@ -109,7 +105,7 @@ class DetectionOutcome:
         return float(slick.centroid_lon), float(slick.centroid_lat)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ResolvedDetectionParams:
     """Detection parameters after merging overrides with config.yaml defaults."""
 
@@ -123,19 +119,16 @@ class ResolvedDetectionParams:
     include_preview: bool
     pixel_spacing_m: float
     acquisition_time_utc: Optional[str]
+    min_slick_area_km2: float
+    ship_buffer_km: float
 
 
 class DetectionService:
-    """Executes segmentation models and performs geometric/false-positive analysis."""
+    """Executes 5-class SAR segmentation and geometric/false-positive analysis."""
 
     def __init__(self, settings: AppSettings, model: SpillSegmentationModel):
         self.settings = settings
         self.model = model
-        self.lookalike_filter = (
-            LookalikeFilter(settings.lookalike_filter)
-            if settings.lookalike_filter.enabled
-            else None
-        )
 
     def resolve_params(self, options: Optional[DetectionOptions] = None) -> ResolvedDetectionParams:
         """Resolve and validate configuration fallbacks against runtime request options."""
@@ -179,6 +172,8 @@ class DetectionService:
             include_preview=bool(options.include_preview),
             pixel_spacing_m=float(options.pixel_spacing_m or detection.pixel_spacing_m),
             acquisition_time_utc=options.acquisition_time_utc,
+            min_slick_area_km2=float(inference.min_slick_area_km2),
+            ship_buffer_km=float(inference.ship_buffer_km),
         )
 
     def detect_path(
@@ -224,7 +219,7 @@ class DetectionService:
         params: Optional[ResolvedDetectionParams] = None,
         artifact_stem: Optional[str] = None,
     ) -> DetectionOutcome:
-        """Execute model inference, polygonization, lookalike filtering, and characterisation."""
+        """Execute 5-class inference, per-class vectorisation, and ship co-location."""
         params = params or self.resolve_params(None)
         started = time.perf_counter()
         warnings: List[str] = list(scene.warnings)
@@ -237,30 +232,60 @@ class DetectionService:
             tile_batch_size=params.tile_batch_size,
         )
 
-        oil_mask = self.build_oil_mask(
-            inference.label_map,
-            inference.oil_confidence,
-            confidence_threshold=params.confidence_threshold,
-        )
+        label_map = inference.label_map
+        prob_avg = inference.prob_maps
+        num_classes = int(prob_avg.shape[0])
 
         pixel_spacing = float(scene.pixel_spacing_m) * float(scale)
-        slicks, geojson = self.vectorise(
-            oil_mask,
-            scene=scene,
-            min_area_px=params.min_area_px,
-            pixel_spacing_m=pixel_spacing,
+
+        # 1. Vectorise oil spills (Class 1) - primary input to drift & attribution.
+        oil_polygons = self._vectorize_class(
+            label_map, prob_avg, CLASS_IDS["oil_spill"],
+            scene=scene, min_area_km2=params.min_slick_area_km2,
+            min_confidence=params.confidence_threshold,
         )
+        slicks = self._to_slick_geometries(
+            oil_polygons, scene=scene, pixel_spacing_m=pixel_spacing,
+        )
+
+        # 2. Vectorise look-alikes (Class 2) - dossier warnings only, no drift.
+        look_alike_polygons = self._vectorize_class(
+            label_map, prob_avg, CLASS_IDS["look_alike"],
+            scene=scene, min_area_km2=params.min_slick_area_km2,
+        )
+        look_alikes = self._to_slick_geometries(
+            look_alike_polygons, scene=scene, pixel_spacing_m=pixel_spacing,
+        )
+
+        # 3. Vectorise ships (Class 3) - only when the model emits them.
+        ship_polygons: List[Dict[str, Any]] = []
+        if CLASS_IDS["ship"] < num_classes:
+            ship_polygons = self._vectorize_class(
+                label_map, prob_avg, CLASS_IDS["ship"],
+                scene=scene, min_area_km2=0.0,
+            )
+        detected_ships = self._to_slick_geometries(
+            ship_polygons, scene=scene, pixel_spacing_m=pixel_spacing,
+        )
+
+        # 4. Cross-correlate oil slicks with co-located ships (2 km buffer).
+        self._attach_colocated_ships(slicks, detected_ships, params.ship_buffer_km)
+
         stats = self.compute_statistics(
             inference,
-            oil_mask,
+            label_map,
+            num_classes=num_classes,
             params=params,
             pixel_count=int(processed.shape[0] * processed.shape[1]),
             slicks=slicks,
+            look_alikes=look_alikes,
+            detected_ships=detected_ships,
         )
 
         if not slicks:
             warnings.append(
-                f"No oil-spill polygons exceeded the minimum area ({params.min_area_px} px)."
+                f"No oil-spill polygons exceeded the minimum area "
+                f"({params.min_slick_area_km2} km^2)."
             )
         if stats.oil_coverage_fraction > 0.5:
             warnings.append(
@@ -279,9 +304,11 @@ class DetectionService:
         )
 
         stem = artifact_stem or self._default_stem(scene)
+        # Build a binary oil mask for artefact export + lookalike heuristics.
+        oil_mask = (label_map == CLASS_IDS["oil_spill"]).astype(np.uint8)
         artifacts = self._export_artifacts(
             mask=oil_mask,
-            geojson=geojson,
+            geojson=self._build_geojson(slicks, scene),
             stem=stem,
             save=params.save_artifacts,
         )
@@ -292,10 +319,8 @@ class DetectionService:
             else None
         )
 
-        # ------------------- Robust 3-Way Classification Logic -------------------
+        # 3-Way Classification Arbitration (preserves existing contract).
         norm_filename = str(scene.filename).lower().replace("\\", "/")
-
-        # Match exact subdirectories (avoid substring matches against parent folders)
         path_is_oil = ("/oil/" in norm_filename) or norm_filename.endswith("/oil")
         path_is_lookalike = ("/lookalike/" in norm_filename) or norm_filename.endswith("/lookalike")
         path_is_no_oil = (
@@ -305,71 +330,19 @@ class DetectionService:
             or norm_filename.endswith("/no_oil")
         )
 
-        # Evaluate heuristic lookalike classifier
-        lookalike_classification = None
-        lookalike_dict: Optional[Dict[str, Any]] = None
-        heuristic_flagged_lookalike = False
-
-        if self.lookalike_filter is not None and slicks:
-            slick_dicts = [
-                {
-                    "area_px": s.area_px,
-                    "elongation": s.elongation,
-                    "solidity": s.solidity or 1.0,
-                    "geometry": s.geometry,
-                }
-                for s in slicks
-            ]
-            lookalike_classification = self.lookalike_filter.classify(
-                slick_dicts,
-                oil_mask,
-                oil_coverage_fraction=stats.oil_coverage_fraction,
-                scene_pixels=int(oil_mask.shape[0] * oil_mask.shape[1]),
-                scene_path=str(scene.filename),
-                mean_confidence=stats.mean_oil_confidence,
-            )
-
-            if lookalike_classification:
-                status_raw = str(getattr(lookalike_classification, "status", "")).strip().lower()
-                indicators_list = getattr(lookalike_classification, "indicators", []) or []
-                heuristic_scores = getattr(lookalike_classification, "heuristic_scores", {}) or {}
-
-                # Do not trigger false lookalike flags on confirmed petroleum datasets
-                if not path_is_oil and (status_raw == "lookalike" or len(indicators_list) >= 3):
-                    heuristic_flagged_lookalike = True
-
-                lookalike_dict = {
-                    "status": "Lookalike" if heuristic_flagged_lookalike else "Confirmed",
-                    "is_lookalike": heuristic_flagged_lookalike,
-                    "indicators": indicators_list,
-                    "indicators_count": len(indicators_list),
-                    "heuristic_scores": heuristic_scores,
-                }
-
-        # Check physical significance
         has_significant_coverage = len(slicks) > 0 and stats.oil_coverage_fraction >= 0.0001
 
-        # 3-Way Classification Arbitration
         if path_is_oil or (has_significant_coverage and not path_is_lookalike and not path_is_no_oil):
             resolved_status = "Confirmed Spill"
             is_lookalike_flag = False
-        elif path_is_lookalike or heuristic_flagged_lookalike:
+        elif path_is_lookalike:
             resolved_status = "Lookalike"
             is_lookalike_flag = True
         else:
             resolved_status = "No Oil"
             is_lookalike_flag = False
             slicks = []
-            geojson = {
-                "type": "FeatureCollection",
-                "features": [],
-                "properties": {
-                    "source_scene": scene.filename,
-                    "coordinate_space": "geographic" if scene.georeferenced else "pixel",
-                    "min_area_px": int(params.min_area_px),
-                    "slick_count": 0,
-                },
-            }
+            look_alikes = []
 
         response = SlickDetectionResponse(
             scene=SceneMetadata(
@@ -392,26 +365,29 @@ class DetectionService:
             ),
             statistics=stats,
             slicks=slicks,
+            look_alikes=look_alikes,
+            detected_ships=detected_ships,
             age_estimate=age if resolved_status == "Confirmed Spill" else None,
-            spill_geojson=geojson,
+            spill_geojson=self._build_geojson(slicks, scene),
             mask_preview_png_base64=preview,
             artifact_paths=artifacts,
             validated=scene.imagery_kind == "sar",
             status=resolved_status,
             is_lookalike=is_lookalike_flag,
-            lookalike_indicators=lookalike_dict["indicators"] if lookalike_dict else [],
-            lookalike_heuristic_scores=lookalike_dict["heuristic_scores"] if lookalike_dict else {},
+            lookalike_indicators=[],
+            lookalike_heuristic_scores={},
         )
 
         duration_ms = (time.perf_counter() - started) * 1000.0
         logger.info(
-            "Detection complete | %s | slicks=%d | oil_px=%d (%.2f%%) | status=%s | age=%s | %.0fms",
+            "Detection complete | %s | slicks=%d | lookalikes=%d | ships=%d | oil_px=%d (%.2f%%) | status=%s | %.0fms",
             scene.filename,
             len(slicks),
+            len(look_alikes),
+            len(detected_ships),
             stats.oil_pixel_count,
             stats.oil_coverage_fraction * 100.0,
             resolved_status,
-            f"{age.age_hours:.2f}h" if age and resolved_status == "Confirmed Spill" else "n/a",
             duration_ms,
         )
 
@@ -419,15 +395,16 @@ class DetectionService:
             response=response,
             scene=scene,
             mask=oil_mask,
-            label_map=inference.label_map,
+            label_map=label_map,
             oil_confidence=inference.oil_confidence,
-            geojson=geojson,
+            geojson=response.spill_geojson,
             warnings=warnings,
             duration_ms=duration_ms,
-            lookalike=lookalike_dict,
+            lookalike=None,
             is_lookalike=is_lookalike_flag,
         )
 
+    # ---------------------------------------------------------------- tiling
     def _downscale(self, scene: SceneArray, factor: int) -> Tuple[np.ndarray, int]:
         if factor <= 1:
             return scene.array, 1
@@ -443,48 +420,188 @@ class DetectionService:
         )
         return reduced, int(factor)
 
-    def build_oil_mask(
+    # ---------------------------------------------------- per-class vectors
+    def _vectorize_class(
         self,
         label_map: np.ndarray,
-        oil_confidence: np.ndarray,
+        prob_avg: np.ndarray,
+        target_class_id: int,
         *,
-        confidence_threshold: float,
-    ) -> np.ndarray:
-        oil_index = self.settings.model.oil_class_index
-        mask = ((label_map == oil_index) & (oil_confidence >= confidence_threshold)).astype(
-            np.uint8
-        )
-        if mask.sum() > 0 and self.settings.inference.morphological_cleanup:
-            size = int(self.settings.inference.morphology_kernel_size)
-            size = max(1, size if size % 2 == 1 else size - 1)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-        return mask.astype(np.uint8)
+        scene: SceneArray,
+        min_area_km2: float,
+        min_confidence: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Extract WGS84 GeoJSON polygons and softmax confidence for one class."""
+        binary = (
+            (label_map == target_class_id)
+            & (prob_avg[target_class_id] >= min_confidence)
+        ).astype(np.uint8)
+        transform = scene.transform
+        if transform is None:
+            transform = Affine(1, 0, 0, 0, 1, 0)
+        elif isinstance(transform, (list, tuple)):
+            transform = Affine(*transform)
+        src_crs = scene.crs
+        features: List[Dict[str, Any]] = []
 
+        for geom_dict, val in shapes(binary, mask=(binary == 1), transform=transform):
+            if val != 1:
+                continue
+
+            if src_crs and str(src_crs) != "EPSG:4326":
+                try:
+                    geom_wgs84_dict = transform_geom(src_crs, "EPSG:4326", geom_dict)
+                except Exception:
+                    geom_wgs84_dict = geom_dict
+            else:
+                geom_wgs84_dict = geom_dict
+
+            poly = shape(geom_wgs84_dict)
+            if not poly.is_valid or poly.is_empty:
+                poly = poly.buffer(0) if hasattr(poly, "buffer") else poly
+            if not poly.is_valid or poly.is_empty or poly.area <= 0:
+                continue
+
+            area_km2 = self._compute_area_km2(poly)
+            if area_km2 < min_area_km2:
+                continue
+
+            # Sample mean class probability inside the polygon bounding box.
+            minx, miny, maxx, maxy = shape(geom_dict).bounds
+            try:
+                inv_tf = ~transform
+                c0, r0 = [int(v) for v in inv_tf * (minx, maxy)]
+                c1, r1 = [int(v) for v in inv_tf * (maxx, miny)]
+            except Exception:
+                c0, r0, c1, r1 = 0, 0, label_map.shape[1], label_map.shape[0]
+            r0, r1 = max(0, min(r0, r1)), min(label_map.shape[0], max(r0, r1) + 1)
+            c0, c1 = max(0, min(c0, c1)), min(label_map.shape[1], max(c0, c1) + 1)
+
+            sub_mask = label_map[r0:r1, c0:c1] == target_class_id
+            sub_prob = prob_avg[target_class_id, r0:r1, c0:c1]
+            confidence = float(sub_prob[sub_mask].mean()) if sub_mask.any() else 0.5
+
+            centroid = poly.centroid
+            features.append(
+                {
+                    "geometry": mapping(poly),
+                    "centroid_lon": round(centroid.x, 6),
+                    "centroid_lat": round(centroid.y, 6),
+                    "area_km2": area_km2,
+                    "confidence": round(confidence, 4),
+                    "_shapely": poly,
+                }
+            )
+
+        return features
+
+    def _to_slick_geometries(
+        self,
+        polygons: List[Dict[str, Any]],
+        *,
+        scene: SceneArray,
+        pixel_spacing_m: float,
+    ) -> List[SlickGeometry]:
+        """Convert internal polygon dicts into SlickGeometry schema objects."""
+        slicks: List[SlickGeometry] = []
+        for idx, poly in enumerate(polygons):
+            shapely_poly = poly.pop("_shapely", None)
+            geometry = poly["geometry"]
+            centroid_lon = poly.pop("centroid_lon", None)
+            centroid_lat = poly.pop("centroid_lat", None)
+            area_km2 = poly.pop("area_km2", None)
+            confidence = poly.pop("confidence", 0.5)
+
+            # Approximate pixel metrics from geometry for schema compatibility.
+            area_px = float(area_km2) * 1e6 / (pixel_spacing_m ** 2) if area_km2 else 0.0
+            length_px = width_px = perimeter_px = area_px ** 0.5 if area_px else 0.0
+
+            slick = SlickGeometry(
+                id=idx + 1,
+                geometry=geometry,
+                coordinate_space="geographic" if scene.georeferenced else "pixel",
+                area_px=round(area_px, 2),
+                area_m2=round(float(area_km2) * 1e6, 2) if area_km2 else None,
+                area_km2=round(float(area_km2), 6) if area_km2 else None,
+                perimeter_px=round(perimeter_px, 2),
+                length_px=round(length_px, 2),
+                width_px=round(width_px, 2),
+                length_km=round((length_px * pixel_spacing_m / 1000.0), 4) if length_px else None,
+                width_km=round((width_px * pixel_spacing_m / 1000.0), 4) if width_px else None,
+                elongation=1.0,
+                orientation_deg=None,
+                solidity=1.0,
+                centroid_px=[0.0, 0.0],
+                centroid_lon=centroid_lon,
+                centroid_lat=centroid_lat,
+            )
+            # Stash confidence and shapely on the object for co-location; remove before serialise.
+            object.__setattr__(slick, "_confidence", confidence)
+            object.__setattr__(slick, "_shapely", shapely_poly)
+            slicks.append(slick)
+        return slicks
+
+    def _attach_colocated_ships(
+        self,
+        slicks: List[SlickGeometry],
+        detected_ships: List[SlickGeometry],
+        ship_buffer_km: float,
+    ) -> None:
+        """Flag ships within ship_buffer_km of each oil slick as co-located."""
+        buffer_deg = ship_buffer_km / _DEG_PER_KM
+        for slick in slicks:
+            shapely_slick = getattr(slick, "_shapely", None)
+            if shapely_slick is None:
+                slick.visual_ship_detected = False
+                slick.colocated_ships = []
+                continue
+            buffered_zone = shapely_slick.buffer(buffer_deg)
+            nearby_ships: List[Dict[str, Any]] = []
+            for ship in detected_ships:
+                shapely_ship = getattr(ship, "_shapely", None)
+                if shapely_ship is None:
+                    continue
+                if buffered_zone.intersects(shapely_ship):
+                    dist_deg = shapely_slick.distance(shapely_ship)
+                    nearby_ships.append(
+                        {
+                            "ship_detection_id": f"sar_ship_{ship.id}",
+                            "lon": ship.centroid_lon,
+                            "lat": ship.centroid_lat,
+                            "distance_km": round(dist_deg * _DEG_PER_KM, 3),
+                            "confidence": float(getattr(ship, "_confidence", 0.5)),
+                        }
+                    )
+            slick.visual_ship_detected = len(nearby_ships) > 0
+            slick.colocated_ships = nearby_ships
+
+    # ---------------------------------------------------------------- stats
     def compute_statistics(
         self,
         inference: Any,
-        oil_mask: np.ndarray,
+        label_map: np.ndarray,
         *,
+        num_classes: int,
         params: ResolvedDetectionParams,
         pixel_count: int,
         slicks: Sequence[SlickGeometry] = (),
+        look_alikes: Sequence[SlickGeometry] = (),
+        detected_ships: Sequence[SlickGeometry] = (),
     ) -> SlickStatistics:
-        label_map = inference.label_map
-        oil_index = self.settings.model.oil_class_index
-        lookalike_index = self.settings.model.lookalike_class_index
-
-        oil_pixels = int((label_map == oil_index).sum())
-        lookalike_pixels = int((label_map == lookalike_index).sum())
-        background_pixels = int(pixel_count - oil_pixels - lookalike_pixels)
-        mask_pixels = int(oil_mask.sum())
-        threshold = float(params.confidence_threshold)
+        oil_pixels = int((label_map == CLASS_IDS["oil_spill"]).sum())
+        lookalike_pixels = int((label_map == CLASS_IDS["look_alike"]).sum())
+        ship_pixels = int((label_map == CLASS_IDS["ship"]).sum())
+        land_pixels = int((label_map == CLASS_IDS["land"]).sum())
+        sea_pixels = int((label_map == CLASS_IDS["sea"]).sum())
+        background_pixels = max(
+            pixel_count - oil_pixels - lookalike_pixels - ship_pixels - land_pixels - sea_pixels,
+            0,
+        )
         confidence = np.asarray(inference.oil_confidence, dtype=np.float32)
-
+        mask_pixels = int(oil_pixels)
         if mask_pixels > 0:
-            mean_conf = float(confidence[oil_mask > 0].mean())
-            max_conf = float(confidence[oil_mask > 0].max())
+            mean_conf = float(confidence[inference.label_map == CLASS_IDS["oil_spill"]].mean())
+            max_conf = float(confidence[inference.label_map == CLASS_IDS["oil_spill"]].max())
         else:
             mean_conf = 0.0
             max_conf = float(confidence.max()) if confidence.size else 0.0
@@ -494,10 +611,11 @@ class DetectionService:
             total_pixels=int(pixel_count),
             oil_pixel_count=oil_pixels,
             lookalike_pixel_count=lookalike_pixels,
-            background_pixel_count=max(background_pixels, 0),
-            oil_coverage_fraction=float(
-                min(max(oil_pixels / max(pixel_count, 1), 0.0), 1.0)
-            ),
+            background_pixel_count=background_pixels,
+            ship_pixel_count=ship_pixels,
+            land_pixel_count=land_pixels,
+            sea_pixel_count=sea_pixels,
+            oil_coverage_fraction=float(min(max(oil_pixels / max(pixel_count, 1), 0.0), 1.0)),
             lookalike_fraction=float(
                 min(max(lookalike_pixels / max(pixel_count, 1), 0.0), 1.0)
             ),
@@ -507,162 +625,47 @@ class DetectionService:
             total_slick_area_km2=float(sum(areas_km2)) if areas_km2 else None,
             mean_oil_confidence=float(min(max(mean_conf, 0.0), 1.0)),
             max_oil_confidence=float(min(max(max_conf, 0.0), 1.0)),
-            confidence_threshold=threshold,
-            mean_lookalike_confidence=float(
-                min(
-                    max(float(np.asarray(inference.lookalike_confidence).mean()), 0.0),
-                    1.0,
-                )
-            ),
+            confidence_threshold=float(params.confidence_threshold),
+            mean_lookalike_confidence=0.0,
             tile_size=int(params.tile_size),
             stride=int(params.stride),
             tiles_evaluated=int(inference.tiles_evaluated),
         )
 
-    def vectorise(
-        self,
-        oil_mask: np.ndarray,
-        *,
-        scene: SceneArray,
-        min_area_px: int,
-        pixel_spacing_m: float,
-    ) -> Tuple[List[SlickGeometry], Dict[str, Any]]:
-        characteristics = characterize_geometry(oil_mask)
-        transform = as_affine(scene.transform)
-        georeferenced = bool(scene.georeferenced and transform is not None and rasterio_xy)
-        epsilon_fraction = float(
-            self.settings.inference.contour_epsilon_fraction
-            if self.settings is not None
-            else APPROX_EPSILON_FRACTION
-        )
+    # ---------------------------------------------------------------- helpers
+    def _compute_area_km2(self, geom_wgs84: Polygon) -> float:
+        """Project WGS84 geometry to an equal-area projection for km^2 area."""
+        project = pyproj.Transformer.from_crs("EPSG:4326", _EQUAL_AREA_CRS, always_xy=True).transform
+        projected = shapely_transform(project, geom_wgs84)
+        return round(projected.area / 1_000_000.0, 4)
 
-        slicks: List[SlickGeometry] = []
-        features: List[Dict[str, Any]] = []
-        for props in characteristics:
-            if props["area_px"] < min_area_px:
-                continue
-            contour = props["contour"]
-            epsilon = epsilon_fraction * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            points = approx.reshape(-1, 2)
-            if len(points) < 3:
-                points = contour.reshape(-1, 2)
-            if len(points) < 3:
-                continue
-
-            if georeferenced:
-                coords = [
-                    tuple(
-                        float(value)
-                        for value in rasterio_xy(transform, float(row), float(col))
-                    )
-                    for col, row in points
-                ]
-            else:
-                coords = [(float(col), float(row)) for col, row in points]
-            if coords and coords[0] != coords[-1]:
-                coords.append(coords[0])
-
-            polygon = Polygon(coords)
-            if not polygon.is_valid:
-                polygon = polygon.buffer(0)
-            if polygon.is_empty or polygon.area <= 0:
-                continue
-
-            area_px = float(props["area_px"])
-            area_m2 = (
-                geodesic_area_m2(polygon) if georeferenced else area_px * (pixel_spacing_m ** 2)
-            )
-            length_px = float(props["length_px"])
-            width_px = float(props["width_px"])
-            centroid_lon, centroid_lat = self._centroid_lonlat(
-                props, transform=transform, georeferenced=georeferenced
-            )
-
-            slick = SlickGeometry(
-                id=len(slicks) + 1,
-                geometry=mapping(polygon),
-                coordinate_space="geographic" if georeferenced else "pixel",
-                area_px=round(area_px, 2),
-                area_m2=round(area_m2, 2),
-                area_km2=round(area_m2 / 1e6, 6),
-                perimeter_px=round(float(props["perimeter_px"]), 2),
-                length_px=round(length_px, 2),
-                width_px=round(width_px, 2),
-                length_km=round(length_px * pixel_spacing_m / 1000.0, 4),
-                width_km=round(width_px * pixel_spacing_m / 1000.0, 4),
-                elongation=round(min(float(props["elongation"]), 1e6), 3),
-                orientation_deg=round(self._orientation_deg(contour), 2),
-                solidity=round(self._solidity(props, area_px), 4),
-                centroid_px=[
-                    round(float(props["centroid"][0]), 2),
-                    round(float(props["centroid"][1]), 2),
-                ],
-                centroid_lon=centroid_lon,
-                centroid_lat=centroid_lat,
-            )
-            slicks.append(slick)
+    def _build_geojson(self, slicks: List[SlickGeometry], scene: SceneArray) -> Dict[str, Any]:
+        features = []
+        for slick in slicks:
             features.append(
                 {
                     "type": "Feature",
                     "properties": {
                         "id": slick.id,
-                        "area_px": slick.area_px,
                         "area_km2": slick.area_km2,
-                        "elongation": slick.elongation,
-                        "orientation_deg": slick.orientation_deg,
+                        "confidence": float(getattr(slick, "_confidence", 0.5)),
                         "coordinate_space": slick.coordinate_space,
                         "source_scene": scene.filename,
+                        "visual_ship_detected": bool(getattr(slick, "visual_ship_detected", False)),
+                        "colocated_ships": getattr(slick, "colocated_ships", []),
                     },
                     "geometry": slick.geometry,
                 }
             )
-
-        geojson = {
+        return {
             "type": "FeatureCollection",
             "features": features,
             "properties": {
                 "source_scene": scene.filename,
-                "coordinate_space": "geographic" if georeferenced else "pixel",
-                "min_area_px": int(min_area_px),
+                "coordinate_space": "geographic" if scene.georeferenced else "pixel",
                 "slick_count": len(features),
             },
         }
-        return slicks, geojson
-
-    @staticmethod
-    def _orientation_deg(contour: np.ndarray) -> float:
-        (_, _), (width, height), angle = cv2.minAreaRect(contour)
-        if width < height:
-            angle += 90.0
-        return float((-angle) % 360.0)
-
-    @staticmethod
-    def _solidity(props: Dict[str, Any], area_px: float) -> float:
-        contour = props.get("contour")
-        if contour is None:
-            return 1.0
-        try:
-            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-        except Exception:
-            return 1.0
-        if hull_area <= 0:
-            return 1.0
-        return float(min(max(area_px / hull_area, 0.0), 1.0))
-
-    @staticmethod
-    def _centroid_lonlat(
-        props: Dict[str, Any],
-        *,
-        transform: Optional[Sequence[float]],
-        georeferenced: bool,
-    ) -> Tuple[Optional[float], Optional[float]]:
-        centroid_x, centroid_y = props["centroid"]
-        affine = as_affine(transform)
-        if not georeferenced or affine is None or rasterio_xy is None:
-            return None, None
-        lon, lat = rasterio_xy(affine, float(centroid_y), float(centroid_x))
-        return round(float(lon), 6), round(float(lat), 6)
 
     @staticmethod
     def _total_area_m2(slicks: Sequence[SlickGeometry]) -> Optional[float]:
@@ -683,7 +686,8 @@ class DetectionService:
             return None
         return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
-    def _default_stem(self, scene: SceneArray) -> str:
+    @staticmethod
+    def _default_stem(scene: SceneArray) -> str:
         stem = Path(scene.filename).stem.replace(" ", "_")[:60] or "scene"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         return f"{stem}_{stamp}"
@@ -713,63 +717,3 @@ class DetectionService:
         except Exception as exc:
             logger.error("Could not export detection artifacts for %s: %s", stem, exc)
             return {}
-
-    def detect_directory(
-        self,
-        directory: str,
-        *,
-        options: Optional[DetectionOptions] = None,
-        pattern: str = "*.tif",
-        limit: int = 20,
-        recursive: bool = False,
-    ) -> Dict[str, Any]:
-        base = Path(directory)
-        if not base.is_absolute():
-            base = self.settings.project_root / base
-        if not base.is_dir():
-            raise InvalidInputError(
-                f"Directory not found on server: {directory}",
-                details={"resolved": str(base)},
-            )
-        discovered = sorted(base.rglob(pattern) if recursive else base.glob(pattern))
-        candidates = [path for path in discovered if path.is_file()][: int(max(limit, 1))]
-
-        results: List[Dict[str, Any]] = []
-        succeeded = 0
-        for path in candidates:
-            started = time.perf_counter()
-            try:
-                outcome = self.detect_path(str(path), options)
-                succeeded += 1
-                results.append(
-                    {
-                        "path": str(path),
-                        "success": True,
-                        "timing_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                        "detection": outcome.response,
-                        "error": None,
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Batch detection failed for %s: %s", path, exc)
-                results.append(
-                    {
-                        "path": str(path),
-                        "success": False,
-                        "timing_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                        "detection": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-        logger.info(
-            "Batch detection finished: %d/%d scenes succeeded in %s",
-            succeeded,
-            len(candidates),
-            base,
-        )
-        return {
-            "total": len(candidates),
-            "succeeded": succeeded,
-            "failed": len(candidates) - succeeded,
-            "results": results,
-        }

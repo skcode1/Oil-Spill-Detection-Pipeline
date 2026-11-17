@@ -13,6 +13,7 @@ attribution_score_pct are reported on a 0-100 scale.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
@@ -260,6 +261,19 @@ class SlickGeometry(BaseModel):
     centroid_px: List[float]
     centroid_lon: Optional[float] = None
     centroid_lat: Optional[float] = None
+    confidence: Optional[float] = Field(
+        None, description="Mean softmax confidence for the polygon's class."
+    )
+    #: True when a SAR ship polygon lies within ship_buffer_km of this oil slick.
+    visual_ship_detected: bool = Field(
+        False,
+        description="True when a co-located SAR ship was detected near this slick.",
+    )
+    #: Co-located SAR ships within the buffer, each with lon/lat/distance_km/confidence.
+    colocated_ships: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ship detections near this slick (dark-vessel cue).",
+    )
 
 
 class SlickStatistics(BaseModel):
@@ -269,6 +283,9 @@ class SlickStatistics(BaseModel):
     oil_pixel_count: int
     lookalike_pixel_count: int
     background_pixel_count: int
+    ship_pixel_count: int = 0
+    land_pixel_count: int = 0
+    sea_pixel_count: int = 0
     oil_coverage_fraction: float = Field(..., ge=0.0, le=1.0)
     lookalike_fraction: float = Field(..., ge=0.0, le=1.0)
     slick_count: int
@@ -303,6 +320,18 @@ class SlickDetectionResponse(BaseModel):
     scene: SceneMetadata
     statistics: SlickStatistics
     slicks: List[SlickGeometry]
+    #: Look-alike (Class 2) polygons isolated from true oil spills; logged as
+    #: dossier warnings only, never fed into drift modelling.
+    look_alikes: List[SlickGeometry] = Field(
+        default_factory=list,
+        description="Look-alike polygons (biogenic films, wind slicks) excluded from drift.",
+    )
+    #: SAR-detected ships (Class 3); any within ship_buffer_km of an oil slick
+    #: are attached to that slick as colocated_ships.
+    detected_ships: List[SlickGeometry] = Field(
+        default_factory=list,
+        description="SAR ship detections used for visual-AIS cross-correlation.",
+    )
     age_estimate: Optional[SpillAgeEstimate] = None
     spill_geojson: Dict[str, Any] = Field(
         ..., description="GeoJSON FeatureCollection of detected spill polygons."
@@ -513,12 +542,26 @@ class AttributionRequest(BaseModel):
         description="Metocean drift bearing enabling the trajectory-congruence factor.",
     )
 
+    @field_validator("drift_bearing_deg", mode="before")
+    @classmethod
+    def _sanitize_bearing(cls, value: Any) -> Any:
+        """Coerce NaN bearings (no valid drift solution) to None."""
+        if value is not None and isinstance(value, float) and math.isnan(value):
+            return None
+        return value
+
     ais_csv_path: Optional[str] = Field(
         None, description="Server-side AIS CSV/CSV.gz path (any schema; auto-detected)."
     )
     ais_records: Optional[List[Dict[str, Any]]] = Field(
         None,
         description="Inline AIS records.",
+    )
+    #: Verified detection output (5-class) carrying colocated SAR ship detections
+    #: used for visual-AIS cross-correlation and dark-vessel alerting.
+    detection_result: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Detection result dict with slicks[].colocated_ships.",
     )
     temporal_window_hours: Optional[float] = Field(None, gt=0.0, le=720.0)
     chunksize: Optional[int] = Field(None, ge=1000, le=5_000_000)
@@ -624,6 +667,20 @@ class CandidateVessel(BaseModel):
     )
     top_factors: List[str] = Field(default_factory=list)
     explanation: str = ""
+    #: True when an AIS ping at acquisition time matched a SAR ship polygon
+    #: near the slick (visual confirmation).
+    visually_confirmed: bool = Field(
+        False, description="True when visually confirmed by SAR at the slick."
+    )
+    #: Evidence flags explaining the candidate (e.g. VISUALLY_CONFIRMED_AT_SLICK).
+    evidence_flags: List[str] = Field(
+        default_factory=list,
+        description="Human-readable evidence flags for this candidate."
+    )
+    #: The matched SAR ship detection, if any.
+    sar_visual_match: Optional[Dict[str, Any]] = Field(
+        None, description="SAR ship detection matched to this vessel."
+    )
 
 
 class AttributionResponse(BaseModel):
@@ -637,6 +694,11 @@ class AttributionResponse(BaseModel):
     candidate_count: int
     traffic_filter: Optional[TrafficFilterSummary] = None
     candidates: List[CandidateVessel] = Field(default_factory=list)
+    #: Co-located SAR ships with no matching AIS transponder (dark vessel alerts).
+    dark_vessel_alerts: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="SAR-detected ships near the slick with no AIS match.",
+    )
     attribution_geojson: Dict[str, Any] = Field(default_factory=dict)
     artifact_paths: Dict[str, str] = Field(default_factory=dict)
 
@@ -692,9 +754,26 @@ class PipelineOptions(DetectionOptions):
     include_traffic_reconstruction: bool = True
     max_candidates: int = Field(50, ge=1, le=1000)
 
+    # -- end-to-end controls --------------------------------------------------
+    fetch_live_metocean: bool = Field(
+        False,
+        description="When true, download live Copernicus currents + ERA5 winds "
+        "centered on the primary slick before drift (degrades gracefully on failure).",
+    )
+    generate_briefing: bool = Field(
+        False,
+        description="When true, ask Gemini to synthesise an NTRO intelligence "
+        "narrative from the verified dossier (skipped when GEMINI_API_KEY is unset "
+        "or the call fails).",
+    )
+
     @model_validator(mode="after")
     def _check_ais(self) -> "PipelineOptions":
-        # Relaxed check: allows pipeline_service to fall back to settings.ais.default_csv
+        if self.run_attribution and not self.ais_csv_path and not self.ais_records:
+            raise ValueError(
+                "run_attribution=true requires ais_csv_path or ais_records "
+                "(the pipeline service falls back to settings.ais.default_csv)."
+            )
         return self
 
 
@@ -732,12 +811,37 @@ class PipelineResponse(BaseModel):
         None, description="Forward forecast: slick -> predicted future extent."
     )
     attribution: Optional[AttributionResponse] = None
+    #: Optional NTRO intelligence narrative synthesized by Gemini downstream of
+    #: attribution; omitted/skipped when the LLM stage is unavailable.
+    briefing: Optional["IntelligenceBriefing"] = Field(
+        None, description="LLM-synthesised intelligence narrative (Stage 4)."
+    )
     stages: List[PipelineStageReport] = Field(default_factory=list)
     origin_source: str = Field(
         "drift_hindcast",
         description="'drift_hindcast' | 'slick_centroid_fallback' | 'no_slick'",
     )
     warnings: List[str] = Field(default_factory=list)
+
+
+class IntelligenceBriefing(BaseModel):
+    """NTRO intelligence narrative synthesized by Gemini from the verified dossier."""
+
+    executive_summary: str = Field(..., description="Plain-language incident summary.")
+    primary_suspect_rationale: str = Field(
+        ..., description="Why the top candidate vessel is suspected."
+    )
+    environmental_risk_level: str = Field(
+        ..., description="Qualitative risk: 'low', 'moderate', 'high', or 'critical'."
+    )
+    recommended_next_actions: List[str] = Field(
+        default_factory=list,
+        description="Concrete investigative or response actions.",
+    )
+    status: str = Field(
+        "completed",
+        description="'completed' | 'skipped' when Gemini is unavailable or rate-limited.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -832,20 +936,24 @@ class ModelInfo(BaseModel):
     """Loaded model descriptor exposed to the frontend."""
 
     ready: bool
-    architecture: str = "unet"
+    architecture: str = "deeplabv3plus"
     encoder: str = "resnet34"
     in_channels: int = 3
-    num_classes: int = 3
-    class_names: List[str] = Field(default_factory=list)
+    num_classes: int = 5
+    class_names: List[str] = Field(
+        default_factory=lambda: ["sea_surface", "oil_spill", "look_alike", "ship", "land"]
+    )
     oil_class_index: int = 1
     oil_class_name: str = "oil_spill"
+    ship_class_index: int = 3
+    ship_class_name: str = "ship"
     device: str = "cpu"
     checkpoint_path: str = ""
     checkpoint_size_bytes: int = 0
-    input_size: List[int] = Field(default_factory=lambda: [256, 256])
+    input_size: List[int] = Field(default_factory=lambda: [512, 512])
     confidence_threshold: float = 0.5
-    tile_size: int = 256
-    stride: int = 128
+    tile_size: int = 512
+    stride: int = 256
     tile_batch_size: int = 4
     loaded_at_utc: Optional[str] = None
     load_duration_ms: float = 0.0

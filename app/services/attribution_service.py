@@ -22,7 +22,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 import pandas as pd
 from shapely.geometry import mapping
 
@@ -85,6 +84,48 @@ FACTOR_PHRASES = {
     "ais_gaps": "has a transponder blackout across the event",
     "vessel_type": "is of a high-risk vessel class",
 }
+
+
+def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Great-circle distance in kilometres between two WGS84 coordinates."""
+    r = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+#: Radius (km) within which an AIS position is considered to match a SAR ship.
+SAR_MATCH_RADIUS_KM = 0.75
+#: Maximum minutes between an AIS ping and SAR acquisition for a visual match.
+SAR_ACQ_WINDOW_MIN = 30.0
+#: Score boost (0-100 points) for a visually confirmed vessel.
+VISUAL_BOOST_POINTS = 25.0
+
+
+def _parse_ts(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _collect_colocated_sar_ships(detection_result: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten unique co-located ship detections across all slicks in the scene."""
+    if not detection_result:
+        return []
+    seen_ids = set()
+    colocated: List[Dict[str, Any]] = []
+    for slick in detection_result.get("slicks", []) or []:
+        for ship in slick.get("colocated_ships", []) or []:
+            sid = ship.get("ship_detection_id")
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                colocated.append({**ship, "associated_slick_id": slick.get("slick_id")})
+    return colocated
 
 
 def load_pruner() -> Tuple[Any, ...]:
@@ -279,7 +320,11 @@ class AttributionService:
         )
 
     def attribute(self, request: AttributionRequest) -> AttributionResponse:
-        """Prune the traffic, score every vessel and return the leaderboard."""
+        """Prune the traffic, score every vessel and return the leaderboard.
+
+        Adds SAR visual cross-correlation (visual confirmation boost) and dark
+        vessel alerting on top of the multi-factor scored candidates.
+        """
         geometry = self._geometry(
             origin_lon=request.origin_lon,
             origin_lat=request.origin_lat,
@@ -290,6 +335,9 @@ class AttributionService:
         )
         for note in geometry.warnings:
             logger.warning("Attribution geometry: %s", note)
+
+        colocated_ships = _collect_colocated_sar_ships(request.detection_result)
+        acq_dt = _parse_ts(request.t0_utc) or geometry.t0_utc
 
         bundle = self._prune_stage(
             geometry,
@@ -303,7 +351,25 @@ class AttributionService:
         weights, board = self._rank(
             bundle, request.weights, request.drift_bearing_deg, artifact_dir
         )
-        candidates = self._candidates(board, weights, bundle.frame, request.max_candidates)
+        candidates = self._candidates(
+            board, weights, bundle.frame, request.max_candidates,
+            colocated_ships=colocated_ships, acq_dt=acq_dt,
+            sar_match_radius_km=self.settings.attribution.get(
+                "sar_match_radius_km", SAR_MATCH_RADIUS_KM
+            ),
+            visual_boost_points=float(
+                self.settings.attribution.get("visual_boost_points", VISUAL_BOOST_POINTS)
+            ),
+        )
+
+        # Dark vessels: SAR ships near a slick with no matching AIS transponder.
+        matched_ids = {
+            c.sar_visual_match["ship_detection_id"]
+            for c in candidates
+            if c.sar_visual_match
+        }
+        dark_vessels = [s for s in colocated_ships if s["ship_detection_id"] not in matched_ids]
+
         geojson = self._attribution_geojson(geometry, candidates)
         artifacts = self._export(geometry, bundle, candidates, board, geojson, artifact_dir)
 
@@ -316,6 +382,7 @@ class AttributionService:
             candidate_count=len(candidates),
             traffic_filter=bundle.summary,
             candidates=candidates,
+            dark_vessel_alerts=dark_vessels,
             attribution_geojson=geojson,
             artifact_paths=artifacts,
         )
@@ -648,6 +715,11 @@ class AttributionService:
         weights: Dict[str, float],
         frame: pd.DataFrame,
         limit: int,
+        *,
+        colocated_ships: Optional[List[Dict[str, Any]]] = None,
+        acq_dt: Optional[datetime] = None,
+        sar_match_radius_km: float = SAR_MATCH_RADIUS_KM,
+        visual_boost_points: float = VISUAL_BOOST_POINTS,
     ) -> List[CandidateVessel]:
         if board is None or board.empty:
             return []
@@ -669,6 +741,41 @@ class AttributionService:
             ranked = sorted(contributions.items(), key=lambda item: item[1], reverse=True)
             top_factors = [name for name, value in ranked if value > 0.02][:3]
             track = stats.get(mmsi, {})
+
+            # --- SAR visual cross-correlation ---
+            visual_match = None
+            visual_boost = 0.0
+            evidence_flags: List[str] = []
+            if colocated_ships and acq_dt is not None:
+                cpa_lon = _float_or(row.get("lon"), None)
+                cpa_lat = _float_or(row.get("lat"), None)
+                cpa_stamp = _stamp_or(row.get("timestamp"))
+                if cpa_lon is not None and cpa_lat is not None and cpa_stamp is not None:
+                    cpa_dt = _parse_ts(cpa_stamp)
+                    if cpa_dt is not None:
+                        min_delta = abs((cpa_dt - acq_dt).total_seconds()) / 60.0
+                        if min_delta <= SAR_ACQ_WINDOW_MIN:
+                            match = self._match_sar_ship(
+                                cpa_lon, cpa_lat, colocated_ships, sar_match_radius_km
+                            )
+                            if match is not None:
+                                visual_match = match
+                                visual_boost = round(
+                                    visual_boost_points * float(match.get("sar_ship_confidence", 0.5)), 2
+                                )
+                                evidence_flags.append("VISUALLY_CONFIRMED_AT_SLICK")
+
+            score = min(max(score + visual_boost, 0.0), 100.0)
+
+            cpa_km = _float_or(row.get("distance_to_origin_m"), None)
+            if cpa_km is not None:
+                cpa_km = cpa_km / 1000.0
+                if cpa_km <= 2.0:
+                    evidence_flags.append("DIRECT_ORIGIN_OVERPASS")
+            max_ais_gap_hr = _float_or(row.get("ais_gap_score"), None)
+            if max_ais_gap_hr is not None and max_ais_gap_hr >= 2.0:
+                evidence_flags.append("SUSPICIOUS_AIS_SILENCE_GAP")
+
             candidates.append(
                 CandidateVessel(
                     rank=int(_float_or(row.get("rank"), float(len(candidates) + 1))),
@@ -696,9 +803,37 @@ class AttributionService:
                     factor_contributions=contributions,
                     top_factors=top_factors,
                     explanation=_explain(mmsi, score, row, top_factors),
+                    visually_confirmed=visual_match is not None,
+                    evidence_flags=evidence_flags,
+                    sar_visual_match=visual_match,
                 )
             )
         return candidates
+
+    @staticmethod
+    def _match_sar_ship(
+        vessel_lon: float,
+        vessel_lat: float,
+        colocated_ships: List[Dict[str, Any]],
+        radius_km: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the closest SAR ship within ``radius_km`` of the vessel position."""
+        best_match: Optional[Dict[str, Any]] = None
+        best_dist = float("inf")
+        for sar_ship in colocated_ships:
+            dist = haversine_km(
+                vessel_lon, vessel_lat, float(sar_ship["lon"]), float(sar_ship["lat"])
+            )
+            if dist <= radius_km and dist < best_dist:
+                best_dist = dist
+                best_match = {
+                    "ship_detection_id": sar_ship["ship_detection_id"],
+                    "associated_slick_id": sar_ship.get("associated_slick_id"),
+                    "sar_to_ais_offset_km": round(dist, 3),
+                    "slick_to_ship_km": sar_ship.get("distance_km"),
+                    "sar_ship_confidence": sar_ship.get("confidence"),
+                }
+        return best_match
 
     @staticmethod
     def _track_stats(frame: pd.DataFrame) -> Dict[int, Dict[str, Any]]:

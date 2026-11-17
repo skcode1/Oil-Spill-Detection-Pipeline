@@ -1,38 +1,41 @@
-"""Dynamic SAR multi-class segmentation training entry point.
+"""5-class SAR segmentation training entry point (DeepLabV3+ / ResNet-34).
 
-Trains a 3-class U-Net (Background / Oil Spill / Lookalike) using a
-combined Dice + Focal loss to handle severe class imbalance, with
-production-grade SAR augmentations applied via ``SentinelDataset``.
+Trains the Stage-1 detector on the Krestenitis et al. SAR dataset taxonomy:
+0 Sea Surface, 1 Oil Spill, 2 Look-Alike, 3 Ship, 4 Land.
+
+Uses segmentation_models_pytorch DeepLabV3Plus with a ResNet-34 encoder and a
+hybrid Cross-Entropy + Dice loss to handle severe class imbalance, tracking
+per-class IoU so Class 1 (Oil Spill) converges cleanly before the checkpoint is
+promoted.
 
 All paths and hyperparameters are resolved from ``config.yaml`` (sections:
-``paths``, ``model``, ``training``, ``augmentation``) with CLI overrides;
-no training constant is hard-coded.
+``paths``, ``model``, ``training``, ``augmentation``) with CLI overrides.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import rasterio
 import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-try:
-    from dataset import (
-        CLASS_NAMES,
-        NUM_CLASSES,
-        SentinelDataset,
-    )
-except ImportError:
-    from src.dataset import (
-        CLASS_NAMES,
-        NUM_CLASSES,
-        SentinelDataset,
-    )
+# 5-Class SAR Oil Spill Taxonomy (Krestenitis et al. / M4D Sentinel-1 standard)
+CLASS_NAMES: Dict[int, str] = {
+    0: "Sea Surface",
+    1: "Oil Spill",
+    2: "Look-Alike",
+    3: "Ship",
+    4: "Land",
+}
+NUM_CLASSES = 5
 
 
 def _load_config(path: str = "config.yaml") -> dict:
@@ -43,55 +46,129 @@ def _load_config(path: str = "config.yaml") -> dict:
 
 
 # --------------------------------------------------------------------------- #
-#  Combined multi-class loss:  Dice  +  Focal
+#  Dataset
 # --------------------------------------------------------------------------- #
-class CombinedDiceFocalLoss(nn.Module):
-    """Dice Loss + Focal Loss for class-imbalanced multi-class segmentation.
+class SAR5ClassDataset(Dataset):
+    """Paired SAR GeoTIFF tiles and 5-class integer masks (values 0..4).
 
-    Oil spills occupy a tiny fraction of pixels; standard Cross-Entropy will
-    bias the model towards predicting 'Background' everywhere.  Dice
-    maximises the overlap of rare classes while Focal down-weights
-    easy-to-classify majority pixels, forcing the model to learn oil edges
-    aggressively.
+    Directory layout::
+
+        root/images/*.tif
+        root/masks/*.tif   (or .png)
     """
 
-    def __init__(
-        self,
-        num_classes: int = NUM_CLASSES,
-        dice_weight: float = 0.5,
-        focal_weight: float = 1.0,
-        focal_gamma: float = 2.0,
-        ignore_index: Optional[int] = None,
-    ):
+    def __init__(self, image_dir: str, mask_dir: str, transform=None):
+        self.image_paths = sorted(Path(image_dir).glob("*.tif"))
+        self.mask_dir = Path(mask_dir)
+        self.transform = transform
+        if not self.image_paths:
+            raise FileNotFoundError(f"No .tif scenes found in {image_dir}")
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def _load_sar_tile(self, path: Path) -> np.ndarray:
+        with rasterio.open(path) as src:
+            data = src.read().astype(np.float32)
+        if data.shape[0] == 1:
+            vv = data[0]
+            data = np.stack([vv, vv, vv], axis=0)
+        elif data.shape[0] == 2:
+            vv, vh = data[0], data[1]
+            ratio = np.divide(vv, vh + 1e-6)
+            data = np.stack([vv, vh, ratio], axis=0)
+        else:
+            data = data[:3]
+        # Normalise SAR backscatter to [0, 1] per channel
+        if data.max() > 1.0 or data.min() < 0.0:
+            for c in range(3):
+                p2, p98 = np.percentile(data[c], (2, 98))
+                data[c] = np.clip((data[c] - p2) / (p98 - p2 + 1e-6), 0.0, 1.0)
+        return np.transpose(data, (1, 2, 0))
+
+    def _load_mask(self, img_path: Path) -> np.ndarray:
+        mask_path = self.mask_dir / img_path.name
+        if not mask_path.exists():
+            mask_path = self.mask_dir / f"{img_path.stem}.png"
+        with rasterio.open(mask_path) as src:
+            mask = src.read(1).astype(np.int64)
+        return np.where((mask >= 0) & (mask < NUM_CLASSES), mask, 0)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_path = self.image_paths[idx]
+        image = self._load_sar_tile(img_path)
+        mask = self._load_mask(img_path)
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"].long()
+        else:
+            image = torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
+            mask = torch.from_numpy(mask).long()
+        return image, mask
+
+
+# --------------------------------------------------------------------------- #
+#  Transforms
+# --------------------------------------------------------------------------- #
+def get_transforms(img_size: int = 512):
+    try:
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+
+        train_tf = A.Compose(
+            [
+                A.Resize(img_size, img_size),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                ToTensorV2(),
+            ]
+        )
+        val_tf = A.Compose([A.Resize(img_size, img_size), ToTensorV2()])
+        return train_tf, val_tf
+    except ImportError:  # pragma: no cover - optional at train time only
+        def identity(image=None, mask=None):
+            return {"image": image, "mask": mask}
+
+        return identity, identity
+
+
+# --------------------------------------------------------------------------- #
+#  Loss
+# --------------------------------------------------------------------------- #
+class HybridSARLoss(nn.Module):
+    """Weighted Cross-Entropy + multi-class Dice Loss for small oil/ship targets."""
+
+    def __init__(self, class_weights: List[float]):
         super().__init__()
-        self.dice = smp.losses.DiceLoss(
-            mode=smp.losses.MULTICLASS_MODE,
-            classes=list(range(num_classes)),
-            from_logits=True,
-            ignore_index=ignore_index,
-        )
-        self.focal = smp.losses.FocalLoss(
-            mode="multiclass",
-            gamma=focal_gamma,
-            ignore_index=ignore_index,
-            reduction="mean",
-        )
-        self.dice_weight = float(dice_weight)
-        self.focal_weight = float(focal_weight)
+        self.ce = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32))
+        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return (
-            self.dice_weight * self.dice(logits, targets)
-            + self.focal_weight * self.focal(logits, targets)
-        )
+        self.ce.weight = self.ce.weight.to(logits.device)
+        return 0.5 * self.ce(logits, targets) + 0.5 * self.dice(logits, targets)
+
+
+def compute_per_class_iou(
+    preds: torch.Tensor, targets: torch.Tensor
+) -> Dict[str, float]:
+    ious: Dict[str, float] = {}
+    for cls_id, cls_name in CLASS_NAMES.items():
+        pred_mask = preds == cls_id
+        true_mask = targets == cls_id
+        intersection = int((pred_mask & true_mask).sum().item())
+        union = int((pred_mask | true_mask).sum().item())
+        ious[cls_name] = round(intersection / union, 4) if union > 0 else float("nan")
+    return ious
 
 
 # --------------------------------------------------------------------------- #
 #  Model factory
 # --------------------------------------------------------------------------- #
 def build_model(model_cfg: Dict[str, Any]) -> nn.Module:
-    """Instantiate the segmentation model from config."""
-    return smp.Unet(
+    """Instantiate the DeepLabV3+ segmentation model from config."""
+    return smp.DeepLabV3Plus(
         encoder_name=str(model_cfg.get("encoder", "resnet34")),
         encoder_weights=model_cfg.get("encoder_weights"),
         in_channels=int(model_cfg.get("in_channels", 3)),
@@ -100,89 +177,26 @@ def build_model(model_cfg: Dict[str, Any]) -> nn.Module:
 
 
 # --------------------------------------------------------------------------- #
-#  Checkpoint persistence (with architecture metadata inside the .pth)
+#  Checkpoint persistence
 # --------------------------------------------------------------------------- #
 def _save_checkpoint(model: nn.Module, model_cfg: Dict[str, Any], path: str) -> None:
-    """Persist model weights with architecture metadata inside the .pth."""
+    """Persist model weights with architecture metadata inside the .pt."""
     checkpoint = {
-        "state_dict": model.state_dict(),
-        "config": {
-            "architecture": model_cfg.get("architecture", "unet"),
-            "encoder": model_cfg.get("encoder", "resnet34"),
-            "encoder_weights": model_cfg.get("encoder_weights"),
-            "in_channels": int(model_cfg.get("in_channels", 3)),
-            "classes": int(model_cfg.get("classes", NUM_CLASSES)),
-            "class_names": list(model_cfg.get("class_names", CLASS_NAMES)),
-        },
+        "model_state_dict": model.state_dict(),
+        "num_classes": int(model_cfg.get("classes", NUM_CLASSES)),
+        "class_names": list(model_cfg.get("class_names", [CLASS_NAMES[i] for i in range(NUM_CLASSES)])),
+        "architecture": model_cfg.get("architecture", "deeplabv3plus"),
+        "encoder": model_cfg.get("encoder", "resnet34"),
+        "in_channels": int(model_cfg.get("in_channels", 3)),
     }
     torch.save(checkpoint, path)
     print(f"--> Saved checkpoint (with metadata) to {path}")
-
-
-def _load_state_dict_into(model: nn.Module, path: str) -> None:
-    """Load weights from a checkpoint produced by :func:`_save_checkpoint`."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    state_dict = (
-        checkpoint.get("state_dict", checkpoint)
-        if isinstance(checkpoint, dict)
-        else checkpoint
-    )
-    model.load_state_dict(state_dict, strict=True)
-
-
-def _checkpoint_sanity(
-    model: nn.Module, model_cfg: Dict[str, Any], device: torch.device
-) -> Tuple[bool, str]:
-    """Reject degenerate candidates before they overwrite the checkpoint.
-
-    Dice + Focal on raw logits can drive softmax saturation until the network
-    emits a fixed spatial template that ignores its input - every scene then
-    argmaxes to "background" and the whole pipeline reports ``Clear`` for oil,
-    no-oil and lookalike alike.  A candidate must therefore (a) keep logits in a
-    sane range and (b) classify two *different* inputs differently.
-
-    Returns:
-        ``(ok, reason)`` - ``reason`` is logged either way.
-    """
-    was_training = model.training
-    model.eval()
-    size = tuple(model_cfg.get("input_size", (256, 256)))
-    in_channels = int(model_cfg.get("in_channels", 3))
-    try:
-        with torch.no_grad():
-            first = torch.rand(1, in_channels, *size, device=device) * 2.0 - 1.0
-            second = torch.rand(1, in_channels, *size, device=device) * 2.0 - 1.0
-            logits_first = model(first)
-            logits_second = model(second)
-        if not torch.isfinite(logits_first).all() or not torch.isfinite(logits_second).all():
-            return False, "non-finite logits"
-        max_abs = float(
-            torch.maximum(logits_first.abs(), logits_second.abs()).max()
-        )
-        if max_abs > 500.0:
-            return False, f"exploded logits (max |logit| = {max_abs:.0f} > 500)"
-        disagreement = float(
-            (logits_first.argmax(1) != logits_second.argmax(1)).float().mean()
-        )
-        if disagreement < 0.005:
-            return False, (
-                "input-independent output (two random inputs disagree on only "
-                f"{100.0 * disagreement:.2f} % of pixels)"
-            )
-        return True, (
-            f"max |logit| = {max_abs:.1f}, "
-            f"input disagreement = {100.0 * disagreement:.1f} %"
-        )
-    finally:
-        if was_training:
-            model.train()
 
 
 # --------------------------------------------------------------------------- #
 #  Training orchestration
 # --------------------------------------------------------------------------- #
 def _resolve_split_dirs(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """Return (train_dir, val_dir) from config paths."""
     paths_cfg = cfg.get("paths") or {}
     return paths_cfg.get("train_split"), paths_cfg.get("val_split")
 
@@ -197,7 +211,6 @@ def _build_loaders(
     data_root: Optional[str],
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[int], Optional[int]]:
     """Construct train / val DataLoaders from config or CLI args."""
-    paths_cfg = cfg.get("paths") or {}
     train_size = val_size = None
 
     if data_root is not None:
@@ -206,85 +219,55 @@ def _build_loaders(
     else:
         train_dir, val_dir = _resolve_split_dirs(cfg)
 
-    # --- Training loader ---
     train_loader: Optional[DataLoader] = None
     if train_dir and os.path.isdir(train_dir):
-        train_ds = SentinelDataset(
+        train_ds = SAR5ClassDataset(
             os.path.join(train_dir, "images"),
             os.path.join(train_dir, "masks"),
-            size=input_size,
-            num_classes=num_classes,
-            augment=True,
-            augmentation_cfg=aug_cfg,
+            transform=get_transforms(input_size[0])[0],
         )
         train_size = len(train_ds)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-    else:
-        # Fallback: single flat directory with random split
-        raw_dir = paths_cfg.get("raw_sar_dir", "data/raw/SAR_training/sentinel")
-        img_dir = os.path.join(raw_dir, "image")
-        label_dir = os.path.join(raw_dir, "label")
-        if os.path.isdir(img_dir):
-            full_dataset = SentinelDataset(
-                img_dir, label_dir, size=input_size, num_classes=num_classes,
-                augment=True, augmentation_cfg=aug_cfg,
-            )
-            train_fraction = float(cfg.get("training", {}).get("train_fraction", 0.85))
-            train_n = int(train_fraction * len(full_dataset))
-            val_n = len(full_dataset) - train_n
-            if val_n > 0:
-                train_ds, val_ds = torch.utils.data.random_split(
-                    full_dataset, [train_n, val_n]
-                )
-            else:
-                train_ds = full_dataset
-                val_ds = None
-            train_size = len(train_ds)
-            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-            if val_ds is not None:
-                val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-                val_size = len(val_ds)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
+        )
 
-    # --- Validation loader ---
     val_loader: Optional[DataLoader] = None
     if val_dir and os.path.isdir(val_dir):
-        val_ds = SentinelDataset(
+        val_ds = SAR5ClassDataset(
             os.path.join(val_dir, "images"),
             os.path.join(val_dir, "masks"),
-            size=input_size,
-            num_classes=num_classes,
-            augment=False,
-            augmentation_cfg=aug_cfg,
+            transform=get_transforms(input_size[0])[1],
         )
         val_size = len(val_ds)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
+        )
 
     return train_loader, val_loader, train_size, val_size
 
 
-def run_training(config: Dict[str, Any], data_root: Optional[str] = None,
-                 init_from: Optional[str] = None) -> None:
+def run_training(config: Dict[str, Any], data_root: Optional[str] = None) -> None:
     paths_cfg = config.get("paths") or {}
     training_cfg = config.get("training") or {}
     model_cfg = config.get("model") or {}
-    aug_cfg = config.get("augmentation") or {}
 
-    paths_cfg.setdefault("model_checkpoint", "models/oil_spill_segmentation_model.pth")
-    model_save_path = paths_cfg["model_checkpoint"]
+    model_save_path = paths_cfg.get("model_checkpoint", "models/sar_5class_deeplabv3p_resnet34.pt")
     os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
 
-    batch_size = int(training_cfg.get("batch_size", 16))
-    epochs = int(training_cfg.get("epochs", 50))
-    learning_rate = float(training_cfg.get("learning_rate", 1e-3))
+    batch_size = int(training_cfg.get("batch_size", 8))
+    epochs = int(training_cfg.get("epochs", 40))
+    learning_rate = float(training_cfg.get("learning_rate", 3e-4))
     weight_decay = float(training_cfg.get("weight_decay", 1e-4))
-    input_size = tuple(model_cfg.get("input_size", (256, 256)))
+    input_size = tuple(model_cfg.get("input_size", (512, 512)))
     num_classes = int(model_cfg.get("classes", NUM_CLASSES))
-    class_names = model_cfg.get("class_names", CLASS_NAMES[:num_classes])
+    class_names = model_cfg.get(
+        "class_names", [CLASS_NAMES[i] for i in range(num_classes)]
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader, val_loader, train_size, val_size = _build_loaders(
-        config, model_cfg, aug_cfg, input_size, num_classes, batch_size, data_root
+        config, model_cfg, {}, input_size, num_classes, batch_size, data_root
     )
 
     if train_loader is None:
@@ -292,95 +275,82 @@ def run_training(config: Dict[str, Any], data_root: Optional[str] = None,
         return
 
     model = build_model(model_cfg).to(device)
-    if init_from:
-        # Warm-start: fine-tuning from a known-good checkpoint converges far
-        # faster than training from scratch on this dataset size.
-        print(f"Loading initial weights from {init_from}")
-        _load_state_dict_into(model, init_from)
-    focal_gamma = float(training_cfg.get("loss", {}).get("focal_gamma", 2.0))
-    criterion = CombinedDiceFocalLoss(
-        num_classes=num_classes,
-        dice_weight=float(training_cfg.get("loss", {}).get("dice_weight", 0.5)),
-        focal_weight=float(training_cfg.get("loss", {}).get("focal_weight", 1.0)),
-        focal_gamma=focal_gamma,
+
+    # Higher weights on Oil Spill (1), Look-Alike (2), Ship (3); lighter on Sea/Land.
+    default_weights = [0.5, 3.0, 2.0, 3.5, 0.5]
+    class_weights = list(
+        model_cfg.get("class_weights", default_weights[:num_classes])
     )
+    criterion = HybridSARLoss(class_weights=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    print(f"Device: {device}")
-    print(f"Train dataset size: {train_size}")
-    if val_size is not None:
-        print(f"Val dataset size:   {val_size}")
-    print(f"Train batches: {len(train_loader)}"
-          f"{f' | Val batches: {len(val_loader)}' if val_loader else ''}")
-    print(f"Profile: epochs={epochs}, batch={batch_size}, lr={learning_rate}, wd={weight_decay}")
-    print(f"Architecture: {model_cfg.get('architecture', 'unet')} / "
-          f"{model_cfg.get('encoder', 'resnet34')} | "
-          f"in_channels={model_cfg.get('in_channels', 3)} | classes={num_classes}")
-    print(f"Class names: {class_names}")
-    print(f"Loss: Dice(MULTICLASS) + Focal(MULTICLASS, gamma={focal_gamma})")
+    best_oil_iou = 0.0
+    Path(model_save_path).parent.mkdir(parents=True, exist_ok=True)
 
-    best_val_loss = float("inf")
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        n_batches = 0
-        for images, masks in train_loader:
-            images, masks = images.to(device), masks.to(device)
+        train_loss = 0.0
+        for imgs, masks in train_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad()
-            logits = model(images)
+            logits = model(imgs)
             loss = criterion(logits, masks)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
+            train_loss += loss.item()
 
-        val_loss = 0.0
-        val_batches = 0
-        if val_loader is not None:
-            model.eval()
-            with torch.no_grad():
-                for images, masks in val_loader:
-                    images, masks = images.to(device), masks.to(device)
-                    logits = model(images)
-                    val_loss += criterion(logits, masks).item()
-                    val_batches += 1
-            val_loss /= max(val_batches, 1)
+        scheduler.step()
 
-        train_batches = max(n_batches, 1)
-        msg = f"Epoch [{epoch + 1}/{epochs}] | Train Loss: {total_loss / train_batches:.4f}"
-        if val_loader is not None:
-            msg += f" | Val Loss: {val_loss:.4f}"
-            if val_loss < best_val_loss:
-                sane, reason = _checkpoint_sanity(model, model_cfg, device)
-                if sane:
-                    best_val_loss = val_loss
-                    _save_checkpoint(model, model_cfg, model_save_path)
-                    msg += f" | -> Saved best ({reason})"
-                else:
-                    msg += f" | !! Candidate REJECTED, not saved ({reason})"
-        print(msg)
+        model.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for imgs, masks in (val_loader or []):
+                imgs = imgs.to(device)
+                logits = model(imgs)
+                preds = torch.argmax(logits, dim=1).cpu()
+                all_preds.append(preds)
+                all_targets.append(masks)
 
-    # Always save final if no validation loop
-    if val_loader is None:
-        sane, reason = _checkpoint_sanity(model, model_cfg, device)
-        if sane:
-            _save_checkpoint(model, model_cfg, model_save_path)
+        if all_preds:
+            preds_cat = torch.cat(all_preds, dim=0)
+            targets_cat = torch.cat(all_targets, dim=0)
+            ious = compute_per_class_iou(preds_cat, targets_cat)
+            oil_iou = ious["Oil Spill"]
+            print(
+                f"Epoch {epoch:02d}/{epochs} | Loss: {train_loss / max(len(train_loader),1):.4f} | "
+                f"Oil IoU: {oil_iou:.4f} | Look-Alike IoU: {ious['Look-Alike']:.4f} | "
+                f"Ship IoU: {ious['Ship']:.4f}"
+            )
+            if not np.isnan(oil_iou) and oil_iou > best_oil_iou:
+                best_oil_iou = oil_iou
+                _save_checkpoint(
+                    model,
+                    {
+                        "classes": num_classes,
+                        "class_names": class_names,
+                        "architecture": model_cfg.get("architecture", "deeplabv3plus"),
+                        "encoder": model_cfg.get("encoder", "resnet34"),
+                        "in_channels": int(model_cfg.get("in_channels", 3)),
+                    },
+                    model_save_path,
+                )
         else:
-            print(f"[!] Final model REJECTED as degenerate, not saved ({reason})")
+            print(f"Epoch {epoch:02d}/{epochs} | Loss: {train_loss / max(len(train_loader),1):.4f} | no val set")
 
-    print(f"\nModel trained successfully and checkpoint saved to: {model_save_path}")
+    print(
+        f"Training complete. Best Oil Spill IoU: {best_oil_iou:.4f} saved to {model_save_path}"
+    )
 
 
 def build_cli() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Dynamic 3-class SAR U-Net training")
+    parser = argparse.ArgumentParser(description="5-class SAR DeepLabV3+ training")
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--data-root", type=str, default=None,
                         help="Root dir containing train/val subdirs")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
-    parser.add_argument("--init-from", type=str, default=None,
-                        help="Warm-start fine-tuning from an existing checkpoint")
     parser.add_argument("--save-to", type=str, default=None,
                         help="Override paths.model_checkpoint save target")
     return parser
@@ -398,4 +368,4 @@ if __name__ == "__main__":
         training_cfg["learning_rate"] = args.learning_rate
     if args.save_to is not None:
         cfg.setdefault("paths", {})["model_checkpoint"] = args.save_to
-    run_training(cfg, data_root=args.data_root, init_from=args.init_from)
+    run_training(cfg, data_root=args.data_root)

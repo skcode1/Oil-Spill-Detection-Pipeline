@@ -1,191 +1,267 @@
-"""
-Dynamic metocean data acquisition.
+"""Incident-specific metocean acquisition for OpenDrift / Lagrangian drift.
 
-Builds dataset URLs for any user-specified bounding box + temporal window
-(typically the output of ``metadata_extractor.extract_spatial_metadata``) and
-optionally downloads them so the OpenDrift engine consumes fresh, incident-
-specific metocean fields instead of cached ones.
+Fetches real ocean currents (Copernicus Marine) and surface winds (ERA5 via
+ECMWF CDS), enforces CF-Convention metadata so OpenDrift's
+``reader_netCDF_CF_generic`` accepts the files, and builds the
+``data/processed/metocean_environment.json`` time-series manifest consumed by
+the built-in Lagrangian fallback engine.
 
-Dataset endpoints are deployment-specific OPeNDAP/HTTP resources; they live in
-``config.yaml -> metocean.datasets`` as templates with the placeholders
-``{min_lat} {max_lat} {min_lon} {max_lon} {start} {end}`` (``start``/``end``
-accept ``strftime`` formats such as ``{start:%Y-%m-%d}``). The built-in
-defaults below are illustrative examples - production deployments override
-them in configuration, not in code.
+``copernicusmarine`` and ``cdsapi`` are imported lazily inside the fetch
+routines so this module imports cleanly even when those optional packages are
+not installed; a live-fetch failure degrades gracefully to the config fallback
+field.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import os
-import re
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Tuple
 
-logger = logging.getLogger(__name__)
+import numpy as np
+import xarray as xr
 
-__all__ = ["MetoceanDataFetcher"]
+logger = logging.getLogger("environment_fetcher")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_DATASET_TEMPLATES: Dict[str, str] = {
-    # Copernicus Marine current field (OPeNDAP constraint expression example).
-    "copernicus_currents": (
-        "https://nrt.cmems-du.eu/thredds/dodsC/global-analysis-forecast-phy-001-024"
-        "?uo[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
-    ),
-    # Generic wind dataset example (OPeNDAP constraint expression).
-    "era5_wind": (
-        "https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis/surface"
-        "/uwnd.sig995.nc?uwnd[({start}):({end})][({min_lat}):({max_lat})][({min_lon}):({max_lon})]"
-    ),
-}
+__all__ = ["fetch_incident_metocean"]
 
 
-class MetoceanDataFetcher:
-    """Constructs and optionally downloads incident-specific metocean fields.
+def parse_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
 
-    Args:
-        datasets: Template overrides merged over ``DEFAULT_DATASET_TEMPLATES``
-            (typically ``config.yaml -> metocean.datasets``).
-        download_dir: Destination directory for fetched files.
-        timeout_seconds: Network timeout for downloads.
-    """
 
-    def __init__(
-        self,
-        datasets: Optional[Mapping[str, str]] = None,
-        download_dir: str = "data/metocean",
-        timeout_seconds: float = 60.0,
-    ) -> None:
-        self.templates: Dict[str, str] = dict(DEFAULT_DATASET_TEMPLATES)
-        if datasets:
-            self.templates.update(dict(datasets))
-        self.download_dir = download_dir
-        self.timeout_seconds = float(timeout_seconds)
+# --------------------------------------------------------------------------- #
+#  Dataset acquisition (lazy optional imports)
+# --------------------------------------------------------------------------- #
+def fetch_copernicus_currents(
+    bbox: Tuple[float, float, float, float],
+    start_dt: datetime,
+    end_dt: datetime,
+    output_path: Path,
+    dataset_id: str = "cmems_mod_glo_phy-cur_anfc_0.083deg_PT6H-i",
+) -> Path:
+    """Download surface ocean currents (uo, vo) in NetCDF via Copernicus Marine."""
+    try:
+        import copernicusmarine  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "copernicusmarine is required for live current downloads; "
+            "install it or disable fetch_live_metocean."
+        ) from exc
 
-    @staticmethod
-    def normalize_window(
-        start: datetime, end: Optional[datetime] = None, window_hours: float = 24.0
-    ) -> Tuple[datetime, datetime]:
-        """Resolves the temporal window; a missing end defaults to start + window."""
-        if end is None:
-            end = start + timedelta(hours=float(window_hours))
-        if end < start:
-            start, end = end, start
-        return start, end
+    min_lon, min_lat, max_lon, max_lat = bbox
+    logger.info(
+        "Fetching Copernicus currents [%s] for %s -> %s", dataset_id, start_dt, end_dt
+    )
+    copernicusmarine.subset(
+        dataset_id=dataset_id,
+        variables=["uo", "vo"],
+        minimum_longitude=min_lon,
+        maximum_longitude=max_lon,
+        minimum_latitude=min_lat,
+        maximum_latitude=max_lat,
+        start_datetime=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        end_datetime=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        minimum_depth=0.0,
+        maximum_depth=1.5,
+        output_directory=str(output_path.parent),
+        output_filename=output_path.name,
+        force_download=True,
+    )
+    _ensure_cf_standard_names(
+        output_path,
+        var_map={"uo": "eastward_sea_water_velocity", "vo": "northward_sea_water_velocity"},
+    )
+    return output_path
 
-    @staticmethod
-    def normalize_bbox(bbox: Sequence[float]) -> Dict[str, float]:
-        """Validates and expands a bbox into named bounds.
 
-        Accepts either ``[min_lon, min_lat, max_lon, max_lat]`` (GeoJSON order)
-        or a mapping with ``min_lat``/``max_lat``/``min_lon``/``max_lon`` keys
-        (the ``metadata_extractor`` layout).
-        """
-        if isinstance(bbox, Mapping):
-            bounds = {
-                "min_lat": float(bbox["min_lat"]),
-                "max_lat": float(bbox["max_lat"]),
-                "min_lon": float(bbox["min_lon"]),
-                "max_lon": float(bbox["max_lon"]),
+def fetch_era5_winds(
+    bbox: Tuple[float, float, float, float],
+    start_dt: datetime,
+    end_dt: datetime,
+    output_path: Path,
+) -> Path:
+    """Download hourly ERA5 10m wind components (u10, v10) via CDS API."""
+    try:
+        import cdsapi  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "cdsapi is required for live ERA5 wind downloads; install it or "
+            "disable fetch_live_metocean."
+        ) from exc
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    # CDS area format: [North, West, South, East]
+    cds_area = [max_lat, min_lon, min_lat, max_lon]
+
+    days_span = (end_dt.date() - start_dt.date()).days + 1
+    dates = [start_dt.date() + timedelta(days=i) for i in range(days_span)]
+    years = sorted({d.strftime("%Y") for d in dates})
+    months = sorted({d.strftime("%m") for d in dates})
+    days = sorted({d.strftime("%d") for d in dates})
+    hours = [f"{h:02d}:00" for h in range(24)]
+
+    logger.info("Fetching ERA5 10m winds for %s -> %s", start_dt, end_dt)
+    client = cdsapi.Client()
+    client.retrieve(
+        "reanalysis-era5-single-levels",
+        {
+            "product_type": ["reanalysis"],
+            "variable": ["10m_u_component_of_wind", "10m_v_component_of_wind"],
+            "year": years,
+            "month": months,
+            "day": days,
+            "time": hours,
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+            "area": cds_area,
+        },
+        str(output_path),
+    )
+    _ensure_cf_standard_names(
+        output_path, var_map={"u10": "x_wind", "v10": "y_wind"}
+    )
+    return output_path
+
+
+def _ensure_cf_standard_names(nc_path: Path, var_map: Dict[str, str]) -> None:
+    """Inject CF standard_name attributes required by OpenDrift's CF reader."""
+    ds = xr.open_dataset(nc_path)
+    modified = False
+    if "valid_time" in ds.dims and "time" not in ds.dims:
+        ds = ds.rename({"valid_time": "time"})
+        modified = True
+    for var_name, standard_name in var_map.items():
+        if var_name in ds.variables and ds[var_name].attrs.get("standard_name") != standard_name:
+            ds[var_name].attrs["standard_name"] = standard_name
+            modified = True
+    if modified:
+        tmp_path = nc_path.with_suffix(".tmp.nc")
+        ds.to_netcdf(tmp_path)
+        ds.close()
+        tmp_path.replace(nc_path)
+    else:
+        ds.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Manifest assembly
+# --------------------------------------------------------------------------- #
+def build_environment_manifest(
+    current_nc: Path,
+    wind_nc: Path,
+    center_lon: float,
+    center_lat: float,
+    manifest_path: Path,
+    wind_drift_factor: float = 0.03,
+) -> Dict[str, Any]:
+    """Sample NetCDF grids at the slick centroid to build the Lagrangian manifest."""
+    ds_cur = xr.open_dataset(current_nc)
+    ds_wnd = xr.open_dataset(wind_nc)
+
+    cur_pt = ds_cur.sel(longitude=center_lon, latitude=center_lat, method="nearest")
+    if "depth" in cur_pt.dims:
+        cur_pt = cur_pt.isel(depth=0)
+
+    wnd_pt = ds_wnd.sel(longitude=center_lon, latitude=center_lat, method="nearest")
+    cur_interp = cur_pt.interp(
+        time=wnd_pt["time"], method="linear", kwargs={"fill_value": "extrapolate"}
+    )
+
+    samples: list[dict[str, Any]] = []
+    for idx, t_val in enumerate(wnd_pt["time"].values):
+        ts_iso = np.datetime_as_string(t_val, unit="s") + "Z"
+        u_c = float(np.nan_to_num(cur_interp["uo"].isel(time=idx).values, nan=0.0))
+        v_c = float(np.nan_to_num(cur_interp["vo"].isel(time=idx).values, nan=0.0))
+        u_w = float(np.nan_to_num(wnd_pt["u10"].isel(time=idx).values, nan=0.0))
+        v_w = float(np.nan_to_num(wnd_pt["v10"].isel(time=idx).values, nan=0.0))
+        samples.append(
+            {
+                "timestamp_utc": ts_iso,
+                "u_current_mps": round(u_c, 4),
+                "v_current_mps": round(v_c, 4),
+                "u_wind_mps": round(u_w, 4),
+                "v_wind_mps": round(v_w, 4),
             }
-        else:
-            min_lon, min_lat, max_lon, max_lat = (float(value) for value in bbox)
-            bounds = {"min_lat": min_lat, "max_lat": max_lat, "min_lon": min_lon, "max_lon": max_lon}
-        if not (-90.0 <= bounds["min_lat"] <= bounds["max_lat"] <= 90.0):
-            raise ValueError(f"Invalid latitude bounds: {bounds}")
-        if not (-180.0 <= bounds["min_lon"] <= bounds["max_lon"] <= 180.0):
-            raise ValueError(f"Invalid longitude bounds: {bounds}")
-        return bounds
+        )
 
-    def build_query(
-        self,
-        bbox: Sequence[float] | Mapping[str, float],
-        start: datetime,
-        end: Optional[datetime] = None,
-        window_hours: float = 24.0,
-    ) -> Dict[str, Any]:
-        """Normalized incident query: named bounds + ISO window."""
-        start, end = self.normalize_window(start, end, window_hours)
-        return {"bbox": self.normalize_bbox(bbox), "start": start, "end": end}
+    ds_cur.close()
+    ds_wnd.close()
 
-    def build_url(
-        self,
-        dataset_key: str,
-        bbox: Sequence[float] | Mapping[str, float],
-        start: datetime,
-        end: Optional[datetime] = None,
-        window_hours: float = 24.0,
-    ) -> str:
-        """Expands a configured dataset template for the requested incident.
+    manifest: Dict[str, Any] = {
+        "source": "copernicus_cmems_era5",
+        "center_lon": center_lon,
+        "center_lat": center_lat,
+        "wind_drift_factor": wind_drift_factor,
+        "samples": samples,
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    logger.info("Wrote %d time-series samples to %s", len(samples), manifest_path)
+    return manifest
 
-        Raises:
-            KeyError: If ``dataset_key`` is not present in the template set.
-        """
-        if dataset_key not in self.templates:
-            raise KeyError(f"Unknown metocean dataset {dataset_key!r}; available: {sorted(self.templates)}")
-        query = self.build_query(bbox, start, end, window_hours)
 
-        def _strftime_replace(match: "re.Match[str]") -> str:
-            timestamp = query["start"] if match.group(1) == "start" else query["end"]
-            return timestamp.strftime(match.group(2))
+# --------------------------------------------------------------------------- #
+#  Public entry point
+# --------------------------------------------------------------------------- #
+def fetch_incident_metocean(
+    lon: float,
+    lat: float,
+    detection_time_utc: str,
+    hindcast_hours: int = 24,
+    forecast_hours: int = 12,
+    buffer_deg: float = 1.5,
+    out_dir: str = "data/processed",
+) -> Dict[str, str]:
+    """Fetch Copernicus currents + ERA5 winds and write the metocean manifest."""
+    det_dt = parse_utc(detection_time_utc)
+    start_dt = det_dt - timedelta(hours=hindcast_hours + 3)
+    end_dt = det_dt + timedelta(hours=forecast_hours + 3)
 
-        template = self.templates[dataset_key]
-        fields = dict(query["bbox"])
-        expanded = template
-        for name, value in fields.items():
-            if isinstance(value, str):
-                expanded = expanded.replace("{" + name + "}", urllib.parse.quote(value, safe=""))
-            else:
-                expanded = expanded.replace("{" + name + "}", str(value))
-        # strftime-style placeholders, e.g. {start:%Y-%m-%d}
-        expanded = re.sub(r"\{(start|end):([^}]+)\}", _strftime_replace, expanded)
-        # DAP constraint expressions keep [ ( ) : characters; encode the rest.
-        expanded = expanded.replace("%28", "(").replace("%29", ")").replace("%3A", ":").replace("%5B", "[").replace("%5D", "]")
-        return expanded
+    bbox = (
+        round(lon - buffer_deg, 3),
+        round(lat - buffer_deg, 3),
+        round(lon + buffer_deg, 3),
+        round(lat + buffer_deg, 3),
+    )
 
-    def fetch(
-        self,
-        dataset_key: str,
-        bbox: Sequence[float] | Mapping[str, float],
-        start: datetime,
-        end: Optional[datetime] = None,
-        window_hours: float = 24.0,
-        dest_path: Optional[str] = None,
-        dry_run: bool = False,
-    ) -> Optional[str]:
-        """Builds the dataset URL and optionally downloads it.
+    base = Path(out_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    current_nc = base / "current.nc"
+    wind_nc = base / "wind.nc"
+    manifest_json = base / "metocean_environment.json"
 
-        Args:
-            dataset_key: Template key (see class docstring).
-            bbox: Incident bounding box (GeoJSON order or named mapping).
-            start: Window start (usually the satellite acquisition time).
-            end: Window end; defaults to ``start + window_hours``.
-            window_hours: Default window length when ``end`` is omitted.
-            dest_path: Explicit destination file; defaults to
-                ``<download_dir>/<dataset_key>_<timestamp>.nc``.
-            dry_run: When True (default) only the URL is returned - useful for
-                validation and for passing OPeNDAP URLs straight to OpenDrift,
-                which streams remote datasets natively.
+    fetch_copernicus_currents(bbox, start_dt, end_dt, current_nc)
+    fetch_era5_winds(bbox, start_dt, end_dt, wind_nc)
+    build_environment_manifest(current_nc, wind_nc, lon, lat, manifest_json)
 
-        Returns:
-            The constructed URL, or the destination path when downloaded.
-        """
-        url = self.build_url(dataset_key, bbox, start, end, window_hours)
-        if dry_run:
-            logger.info("[dry-run] %s -> %s", dataset_key, url)
-            return url
+    return {
+        "current_nc": str(current_nc),
+        "wind_nc": str(wind_nc),
+        "environment_json": str(manifest_json),
+    }
 
-        os.makedirs(self.download_dir, exist_ok=True)
-        if dest_path is None:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            dest_path = os.path.join(self.download_dir, f"{dataset_key}_{stamp}.nc")
-        logger.info("Downloading %s -> %s", url, dest_path)
-        try:
-            with urllib.request.urlopen(url, timeout=self.timeout_seconds) as response, open(dest_path, "wb") as handle:
-                handle.write(response.read())
-        except Exception as exc:
-            logger.error("Metocean download failed for %s: %s", dataset_key, exc)
-            raise
-        return dest_path
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fetch Copernicus currents & ERA5 winds for OpenDrift.")
+    parser.add_argument("--lon", type=float, required=True)
+    parser.add_argument("--lat", type=float, required=True)
+    parser.add_argument("--time", type=str, required=True, help="Satellite acquisition time (ISO UTC)")
+    parser.add_argument("--hindcast-hours", type=int, default=24)
+    parser.add_argument("--forecast-hours", type=int, default=12)
+    parser.add_argument("--out-dir", type=str, default="data/processed")
+    args = parser.parse_args()
+    paths = fetch_incident_metocean(
+        lon=args.lon,
+        lat=args.lat,
+        detection_time_utc=args.time,
+        hindcast_hours=args.hindcast_hours,
+        forecast_hours=args.forecast_hours,
+        out_dir=args.out_dir,
+    )
+    print(json.dumps(paths, indent=2))

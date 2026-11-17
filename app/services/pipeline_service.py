@@ -11,9 +11,12 @@ The pipeline stage manages the chaining and degradation logic:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
@@ -26,6 +29,7 @@ from app.schemas import (
     DriftRequest,
     DriftResponse,
     DriftSource,
+    IntelligenceBriefing,
     PipelineByPathRequest,
     PipelineOptions,
     PipelineResponse,
@@ -33,9 +37,11 @@ from app.schemas import (
     utc_iso,
 )
 from app.services.attribution_service import AttributionService
+from app.services.briefing_service import BriefingService
 from app.services.detection_service import DetectionOutcome, DetectionService
 from app.services.drift_service import DriftService
 from app.services.incident_store import get_incident_store
+from src.environment_fetcher import fetch_incident_metocean
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,61 @@ def _milliseconds(started: float) -> float:
     return round((time.perf_counter() - started) * 1000.0, 2)
 
 
+async def _resolve_incident_metocean_async(
+    *,
+    slicks: list[dict[str, Any]],
+    scene_timestamp_utc: str | None,
+    hindcast_hours: float,
+    forecast_hours: float,
+    request_id: str,
+    timeout_sec: float = 25.0,
+) -> tuple[Optional[dict[str, str]], list[str]]:
+    """
+    Fetch live Copernicus currents + ERA5 winds centred on the primary slick.
+    Returns (metocean_paths, warnings). Never raises on external API failure.
+    """
+    warnings: list[str] = []
+    if not slicks:
+        warnings.append("No slicks detected; skipping live metocean fetch.")
+        return None, warnings
+
+    primary_slick = max(slicks, key=lambda s: float(s.get("area_km2") or 0.0))
+    lon = primary_slick.get("centroid_lon")
+    lat = primary_slick.get("centroid_lat")
+    if lon is None or lat is None:
+        warnings.append("Primary slick missing centroid; falling back to config metocean.")
+        return None, warnings
+
+    acq_time = scene_timestamp_utc or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rid = request_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path("results/api") / rid / "metocean"
+
+    try:
+        paths = await asyncio.wait_for(
+            asyncio.to_thread(
+                fetch_incident_metocean,
+                lon=float(lon),
+                lat=float(lat),
+                detection_time_utc=acq_time,
+                hindcast_hours=int(hindcast_hours),
+                forecast_hours=int(forecast_hours),
+                out_dir=str(out_dir),
+            ),
+            timeout=timeout_sec,
+        )
+        return paths, warnings
+    except asyncio.TimeoutError:
+        msg = f"Live metocean fetch timed out after {timeout_sec}s; degrading to config_fallback."
+        logger.warning(msg)
+        warnings.append(msg)
+        return None, warnings
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Live metocean fetch failed ({type(exc).__name__}: {exc}); degrading to config_fallback."
+        logger.warning(msg)
+        warnings.append(msg)
+        return None, warnings
+
+
 @dataclass(frozen=True)
 class DriftSeed:
     """Shared seed state for forward and backward drift integration."""
@@ -64,7 +125,7 @@ class DriftSeed:
 
 
 class PipelineService:
-    """Chain detection, drift (hindcast + forecast), and attribution into one dossier."""
+    """Chain detection, drift (hindcast + forecast), attribution, and briefing into one dossier."""
 
     def __init__(
         self,
@@ -72,11 +133,13 @@ class PipelineService:
         detection: DetectionService,
         drift: DriftService,
         attribution: AttributionService,
+        briefing: BriefingService,
     ) -> None:
         self.settings = settings
         self.detection = detection
         self.drift = drift
         self.attribution = attribution
+        self.briefing = briefing
 
     # ------------------------------------------------------------- Public API
     def run_path(self, request: PipelineByPathRequest) -> PipelineResponse:
@@ -209,11 +272,28 @@ class PipelineService:
                 warnings=warnings + [str(err)],
             )
 
+        # --- PRE-DRIFT: LIVE METOCEAN FETCH (WITH GRACEFUL FALLBACK) ---
+        metocean_override: Optional[Dict[str, str]] = None
+        if options.fetch_live_metocean and slicks:
+            metocean_override, metocean_warnings = asyncio.run(
+                _resolve_incident_metocean_async(
+                    slicks=[s.model_dump(mode="json") for s in slicks],
+                    scene_timestamp_utc=seed.acquisition_utc,
+                    hindcast_hours=self._hindcast_hours(options),
+                    forecast_hours=self._forecast_hours(options),
+                    request_id=getattr(response, "request_id", "") or "",
+                    timeout_sec=self.settings.metocean.fetch_timeout_sec,
+                )
+            )
+            warnings.extend(metocean_warnings)
+
+        detection_result = response.model_dump(mode="json")
+
         # 2. Drift Hindcast (Backtracking)
         drift_response: Optional[DriftResponse] = None
         origin_source = ORIGIN_FROM_SLICK
         if options.run_drift:
-            drift_response, drift_stage = self._run_drift(options, seed)
+            drift_response, drift_stage = self._run_drift(options, seed, metocean_paths=metocean_override)
             stages.append(drift_stage)
             if drift_response is not None:
                 warnings.extend(drift_response.warnings)
@@ -232,7 +312,9 @@ class PipelineService:
         # 3. Drift Forecast (Forward Extent)
         forecast_response: Optional[DriftResponse] = None
         if options.run_forecast:
-            forecast_response, forecast_stage = self._run_forecast(options, seed)
+            forecast_response, forecast_stage = self._run_forecast(
+                options, seed, metocean_paths=metocean_override
+            )
             stages.append(forecast_stage)
             if forecast_response is not None:
                 warnings.extend(forecast_response.warnings)
@@ -247,7 +329,7 @@ class PipelineService:
         attribution_response = None
         if options.run_attribution:
             attribution_response, attribution_stage = self._run_attribution(
-                outcome, options, drift_response
+                outcome, options, drift_response, detection_result
             )
             stages.append(attribution_stage)
         else:
@@ -259,12 +341,23 @@ class PipelineService:
                 )
             )
 
+        # 5. Briefing (Gemini LLM synthesis) - never blocks the dossier.
+        #    Only reported when explicitly requested, so the default dossier
+        #    keeps the original four detection/drift/forecast/attribution stages.
+        briefing_response = None
+        if options.generate_briefing:
+            briefing_response, briefing_stage = self._run_briefing(
+                detection_result, drift_response, attribution_response
+            )
+            stages.append(briefing_stage)
+
         result = PipelineResponse(
             spill_status=spill_status,
             detection=response,
             drift=drift_response,
             forecast=forecast_response,
             attribution=attribution_response,
+            briefing=briefing_response,
             stages=stages,
             origin_source=origin_source,
             warnings=warnings,
@@ -280,13 +373,17 @@ class PipelineService:
 
     # ------------------------------------------------ Drift Implementations
     def _run_drift(
-        self, options: PipelineOptions, seed: DriftSeed
+        self,
+        options: PipelineOptions,
+        seed: DriftSeed,
+        *,
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[DriftResponse], PipelineStageReport]:
         """Hindcast the slick back to its discharge point."""
         started = time.perf_counter()
         try:
             request = self._drift_request(options, seed, self._hindcast_hours(options))
-            drift_response = self.drift.run_hindcast(request)
+            drift_response = self.drift.run_hindcast(request, metocean_paths=metocean_paths)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Pipeline drift hindcast stage failed")
             return None, PipelineStageReport(
@@ -307,7 +404,11 @@ class PipelineService:
         )
 
     def _run_forecast(
-        self, options: PipelineOptions, seed: DriftSeed
+        self,
+        options: PipelineOptions,
+        seed: DriftSeed,
+        *,
+        metocean_paths: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[DriftResponse], PipelineStageReport]:
         """Project forward trajectories from current observation."""
         started = time.perf_counter()
@@ -315,7 +416,7 @@ class PipelineService:
             request = self._drift_request(
                 options, seed, self._forecast_hours(options)
             )
-            forecast_response = self.drift.run_forecast(request)
+            forecast_response = self.drift.run_forecast(request, metocean_paths=metocean_paths)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Pipeline drift forecast stage failed")
             return None, PipelineStageReport(
@@ -413,6 +514,7 @@ class PipelineService:
         outcome: DetectionOutcome,
         options: PipelineOptions,
         drift_response: Optional[DriftResponse],
+        detection_result: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[AttributionResponse], PipelineStageReport]:
         """Rank AIS vessel traffic against the hindcast discharge point."""
         started = time.perf_counter()
@@ -482,6 +584,7 @@ class PipelineService:
                         options.include_traffic_reconstruction
                     ),
                     max_candidates=options.max_candidates,
+                    detection_result=detection_result,
                 )
             )
         except PipelineError:
@@ -517,3 +620,34 @@ class PipelineService:
     def _describe(exc: Exception) -> str:
         """Compact summary formatting for stage reporting."""
         return f"{type(exc).__name__}: {exc}"
+
+    # ------------------------------------------------ Briefing Stage
+    def _run_briefing(
+        self,
+        detection_result: Dict[str, Any],
+        drift_response: Optional[DriftResponse],
+        attribution_response: Optional[AttributionResponse],
+    ) -> Tuple[Optional[IntelligenceBriefing], PipelineStageReport]:
+        """Synthesize an NTRO intelligence narrative via Gemini (never blocks)."""
+        started = time.perf_counter()
+        dossier: Dict[str, Any] = {
+            "detection": detection_result.get("detection") if isinstance(detection_result, dict) else detection_result,
+            "drift": drift_response.model_dump(mode="json") if drift_response else None,
+            "attribution": attribution_response.model_dump(mode="json") if attribution_response else None,
+        }
+        try:
+            briefing = self.briefing.generate_briefing(dossier)
+            return briefing, PipelineStageReport(
+                stage="briefing",
+                status="completed",
+                duration_ms=_milliseconds(started),
+                detail="Gemini intelligence narrative generated",
+            )
+        except Exception as exc:  # noqa: BLE001 - never blocks the dossier
+            logger.warning("Briefing stage skipped: %s", exc)
+            return None, PipelineStageReport(
+                stage="briefing",
+                status="skipped",
+                duration_ms=_milliseconds(started),
+                detail=f"briefing unavailable ({type(exc).__name__})",
+            )

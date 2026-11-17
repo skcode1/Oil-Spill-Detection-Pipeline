@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pydantic import ValidationError
 
 from app.api.deps import (
     AppServices,
+    get_briefing_service,
     get_drift_service,
     get_pipeline_service,
     get_services,
@@ -29,12 +30,13 @@ from app.errors import InvalidInputError
 from app.schemas import (
     DispatchRequest,
     DispatchResponse,
+    Dossier,
     DriftRequest,
     DriftResponse,
     GeoStats,
-    Dossier,
     HealthResponse,
     IncidentReport,
+    IntelligenceBriefing,
     PipelineByPathRequest,
     PipelineOptions,
     PipelineResponse,
@@ -43,7 +45,7 @@ from app.schemas import (
     SceneEntry,
     ScenesResponse,
 )
-from app.services import DriftService, PipelineService
+from app.services import BriefingService, DriftService, PipelineService
 from app.services.incident_store import get_incident_store
 
 logger = logging.getLogger(__name__)
@@ -276,6 +278,28 @@ async def run_pipeline_upload(
         parsed.run_forecast,
     )
     return pipeline.run_bytes(data, file.filename, options=parsed)
+
+
+# ------------------------------------------------------------------ briefing
+@router.post(
+    "/briefing",
+    response_model=IntelligenceBriefing,
+    tags=["briefing"],
+    summary="Synthesise an NTRO intelligence narrative from a verified dossier.",
+    description="""
+Stage 4 of the hybrid architecture.  Accepts a deterministic dossier JSON
+(detection + drift + attribution) and returns a Gemini-structured NTRO
+intelligence narrative.  The stage is read-only downstream of attribution and
+never blocks the evidence dossier: when ``GEMINI_API_KEY`` is unset or the call
+fails, the response reports ``status="skipped"``.
+""",
+)
+def generate_briefing_endpoint(
+    dossier: Dict[str, Any],
+    briefing: BriefingService = Depends(get_briefing_service),
+) -> IntelligenceBriefing:
+    """Generate an NTRO intelligence briefing from a verified dossier."""
+    return briefing.generate_briefing(dossier)
 
 
 # --------------------------------------------------------------------- drift

@@ -490,6 +490,27 @@ def load_scene_from_bytes(
         pixel_spacing_m=pixel_spacing_m,
         acquisition_time_utc=stamp,
     )
+    # Preserve embedded GeoTIFF georeferencing for in-memory uploads so that
+    # vectorised polygons are emitted in lon/lat (not pixel) space.
+    if suffix in (".tif", ".tiff") and rasterio is not None:
+        try:
+            from rasterio.io import MemoryFile
+
+            with MemoryFile(data) as mem:
+                with mem.open() as ds:
+                    if ds.crs is not None and ds.transform is not None:
+                        scene.georeferenced = True
+                        scene.crs = str(ds.crs)
+                        scene.transform = [
+                            float(ds.transform.a),
+                            float(ds.transform.b),
+                            float(ds.transform.c),
+                            float(ds.transform.d),
+                            float(ds.transform.e),
+                            float(ds.transform.f),
+                        ]
+        except Exception:  # noqa: BLE001 - georeferencing is best-effort for uploads
+            pass
     if suffix in (".png", ".jpg", ".jpeg", ".bmp"):
         scene.warnings.append(
             "Uploaded 8-bit quick-look raster: SAR dynamic range is quantised, "
