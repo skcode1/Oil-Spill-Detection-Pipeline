@@ -47,9 +47,11 @@ from app.services.age_estimator import estimate_spill_age
 from app.services.image_io import SceneArray
 from app.services.lookalike_filter import (
     LookalikeFilter,
-    LookalikeFilterSettings as LFSettings,
     compute_fai,
     compute_ndwi,
+)
+from app.services.lookalike_filter import (
+    LookalikeFilterSettings as LFSettings,
 )
 from app.services.model_service import SpillSegmentationModel
 from src.detect_and_vectorize import _normalize01

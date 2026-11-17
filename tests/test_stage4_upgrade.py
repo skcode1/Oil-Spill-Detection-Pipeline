@@ -330,8 +330,13 @@ def test_build_environment_manifest_writes_structure(tmp_path, monkeypatch):
 #  Step 1: Optical Spectral Indices & Water Masking
 # --------------------------------------------------------------------------- #
 def test_optical_spectral_indices_ndwi_and_fai():
-    from app.services.lookalike_filter import compute_fai, compute_ndwi, LookalikeFilter, LookalikeFilterSettings
     from app.services.detection_service import _preprocess_optical
+    from app.services.lookalike_filter import (
+        LookalikeFilter,
+        LookalikeFilterSettings,
+        compute_fai,
+        compute_ndwi,
+    )
 
     # 1. NDWI tests: Water (green > nir) -> positive; Land (nir > green) -> negative
     green = np.array([[0.8, 0.1]], dtype=np.float32)
@@ -384,9 +389,10 @@ def test_optical_spectral_indices_ndwi_and_fai():
 #  Step 2: 3-Class vs 5-Class Dynamic Checkpoint & Ship Extraction
 # --------------------------------------------------------------------------- #
 def test_detection_service_3class_vs_5class_ship_extraction():
+    from unittest.mock import MagicMock
+
     from app.services.detection_service import DetectionService, ResolvedDetectionParams
     from app.services.image_io import SceneArray
-    from unittest.mock import MagicMock
 
     settings = load_settings()
     mock_model = MagicMock()
@@ -447,8 +453,8 @@ def test_detection_service_3class_vs_5class_ship_extraction():
 #  Step 3: WaveWatch III Stokes Drift & Leeway Provenance
 # --------------------------------------------------------------------------- #
 def test_wavewatch3_stokes_drift_provenance():
-    from app.services.drift_service import MetoceanField
     from app.schemas import MetoceanSample
+    from app.services.drift_service import MetoceanField
 
     # Metocean sample with Stokes drift
     s_stokes = MetoceanSample(
@@ -484,10 +490,10 @@ def test_wavewatch3_stokes_drift_provenance():
 # --------------------------------------------------------------------------- #
 def test_nmea_0183_decoder_and_stream_adapter():
     from datetime import timedelta
+
     from src.ais_pruner import (
-        decode_nmea_ais_sentence,
         AISStreamAdapter,
-        prune_dataframe,
+        decode_nmea_ais_sentence,
     )
 
     # 1. Decode valid Class A NMEA position report sentence

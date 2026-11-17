@@ -11,7 +11,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Optional
+from typing import Deque, Optional
 
 from app.schemas import PipelineResponse
 

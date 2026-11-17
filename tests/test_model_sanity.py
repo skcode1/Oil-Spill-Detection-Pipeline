@@ -22,7 +22,6 @@ These tests pin the two properties that failure violated:
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import tifffile
 

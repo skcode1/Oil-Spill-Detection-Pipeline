@@ -41,9 +41,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fastapi import HTTPException
-
 import numpy as np
+from fastapi import HTTPException
 from shapely.geometry import Polygon, mapping
 from shapely.geometry.base import BaseGeometry
 
