@@ -491,46 +491,6 @@ class AttributionService:
         frame.to_csv(csv_path, index=False)
         return csv_path, f"inline:{len(frame)} pings uploaded with the request", temp_dir
 
-    def _build_synthetic_alignment(
-        self, source_path: Path, geometry: IncidentGeometry
-    ) -> pd.DataFrame:
-        """Create a correlated candidate track around the incident origin for test scenes."""
-        logger.info(
-            "Synthesizing aligned test track at (%.4f, %.4f) around %s",
-            geometry.origin_lon,
-            geometry.origin_lat,
-            geometry.t0_utc.isoformat(),
-        )
-        t0 = geometry.t0_utc
-        # Create a plausible tanker trajectory intersecting the origin envelope
-        timestamps = [
-            (t0 + timedelta(minutes=m)).isoformat()
-            for m in (-120, -90, -60, -30, 0, 30, 60, 90, 120)
-        ]
-        # Angle aligned with the drift orientation
-        angle_rad = math.radians(geometry.orientation_deg)
-        dx = math.sin(angle_rad) * 0.008
-        dy = math.cos(angle_rad) * 0.008
-
-        lons = [geometry.origin_lon + (i - 4) * dx for i in range(len(timestamps))]
-        lats = [geometry.origin_lat + (i - 4) * dy for i in range(len(timestamps))]
-
-        df_synthetic = pd.DataFrame(
-            {
-                "mmsi": [215813000] * len(timestamps),
-                "vessel_name": ["PETRO TRADER"] * len(timestamps),
-                "vessel_type": ["Tanker - Crude Oil"] * len(timestamps),
-                "timestamp": timestamps,
-                "lon": lons,
-                "lat": lats,
-                "sog": [11.2, 10.8, 9.5, 7.2, 5.8, 8.4, 11.5, 12.1, 12.0],
-                "cog": [geometry.orientation_deg] * len(timestamps),
-                "heading": [geometry.orientation_deg] * len(timestamps),
-                "nav_status": ["Under way using engine"] * len(timestamps),
-            }
-        )
-        return df_synthetic
-
     def _prune_stage(
         self,
         geometry: IncidentGeometry,
@@ -557,14 +517,8 @@ class AttributionService:
                     chunksize=rows,
                 )
             except Exception as exc:
-                logger.warning("Standard pruning encountered: %s; invoking alignment", exc)
+                logger.warning("AIS pruning failed for %s: %s; returning empty envelope", source, exc)
                 frame = pd.DataFrame()
-
-            # Fallback: if offline test scenes have zero spatial/temporal overlap with the CSV,
-            # synthesize a correlated AIS vessel passage so the dashboard can demonstrate attribution.
-            if frame.empty:
-                logger.info("No candidates in spatio-temporal envelope. Aligning AIS trajectory.")
-                frame = self._build_synthetic_alignment(source, geometry)
 
             summary: Optional[TrafficFilterSummary] = None
             if include_funnel:
@@ -669,40 +623,14 @@ class AttributionService:
                 ),
             )
         except Exception as exc:
-            logger.warning("Vendored ranker failed: %s; building heuristic board", exc)
-            board = self._fallback_board(bundle.frame, geometry)
+            logger.warning("Vendored ranker failed: %s; returning empty leaderboard", exc)
+            board = pd.DataFrame()
 
         weights = dict(scorer.weights)
         if drift_bearing_deg is None and weights.pop("trajectory", None) is not None:
             total = float(sum(weights.values()))
             weights = {name: value / total for name, value in weights.items()} if total else {}
         return weights, board
-
-    @staticmethod
-    def _fallback_board(frame: pd.DataFrame, geometry: IncidentGeometry) -> pd.DataFrame:
-        """Heuristic fallback leaderboard when scorer detects uncalibrated synthetic data."""
-        rows = []
-        for rank, (mmsi, group) in enumerate(frame.groupby("mmsi"), start=1):
-            row = {
-                "rank": rank,
-                "mmsi": int(mmsi),
-                "vessel_name": group["vessel_name"].iloc[0] if "vessel_name" in group else f"VESSEL-{mmsi}",
-                "vessel_type": group["vessel_type"].iloc[0] if "vessel_type" in group else "Tanker",
-                "attribution_score": 88.5 / rank,
-                "proximity_score": 0.92,
-                "temporal_score": 0.89,
-                "trajectory_score": 0.85,
-                "kinematic_score": 0.80,
-                "ais_gap_score": 0.70,
-                "type_risk_score": 0.95,
-                "distance_to_origin_m": 420.0 * rank,
-                "temporal_offset_min": 12.0 * rank,
-                "lon": group["lon"].iloc[len(group) // 2],
-                "lat": group["lat"].iloc[len(group) // 2],
-                "timestamp": group["timestamp"].iloc[len(group) // 2],
-            }
-            rows.append(row)
-        return pd.DataFrame(rows)
 
     def _artifact_dir(self, geometry: IncidentGeometry) -> Path:
         stamp = geometry.t0_utc.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

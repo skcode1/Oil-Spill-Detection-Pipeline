@@ -18,6 +18,7 @@ interface MapProps {
   showSpill: boolean;
   showVessel: boolean;
   center?: [number, number];
+  regionLabel?: string;
 }
 
 const createPulseIcon = (color: string) => {
@@ -99,7 +100,8 @@ export default function SurveillanceMap({
   culpritGeoJson,
   showSpill,
   showVessel,
-  center = [26.5, 53.0],
+  center = [20.0, 0.0],
+  regionLabel = "MARITIME SURVEILLANCE",
 }: MapProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
@@ -188,7 +190,7 @@ export default function SurveillanceMap({
       <div className="absolute top-3 left-3 z-[1000] flex items-center gap-2 bg-slate-900/90 backdrop-blur-md px-3.5 py-1.5 rounded-lg border border-slate-700/60 shadow-lg pointer-events-auto">
         <Compass className="w-4 h-4 text-indigo-400 animate-spin" />
         <span className="text-xs font-mono font-semibold tracking-wider text-slate-200">
-          GIS PERSIAN GULF TSS
+          {regionLabel}
         </span>
         <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1"></span>
       </div>

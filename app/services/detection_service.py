@@ -236,6 +236,27 @@ class DetectionService:
         prob_avg = inference.prob_maps
         num_classes = int(prob_avg.shape[0])
 
+        # Readiness validation: the 5-class taxonomy requires classes 0-4.
+        # If the loaded checkpoint has fewer classes, ship/land detection is
+        # unavailable and the operator must train a 5-class checkpoint
+        # (src/train.py, Krestenitis SAR dataset) before production use.
+        expected_classes = int(self.settings.model.classes or 5)
+        if num_classes < expected_classes:
+            missing = [
+                name for name, index in CLASS_IDS.items()
+                if index >= num_classes
+            ]
+            warnings.append(
+                f"Checkpoint exposes {num_classes} class(es); {', '.join(missing)} "
+                f"detection unavailable. Train a 5-class checkpoint with src/train.py "
+                f"on the Krestenitis SAR dataset for full oil/ship/land separation."
+            )
+        if num_classes != expected_classes:
+            warnings.append(
+                f"Model class count ({num_classes}) differs from config "
+                f"({expected_classes}); vectorisation uses available classes only."
+            )
+
         pixel_spacing = float(scene.pixel_spacing_m) * float(scale)
 
         # 1. Vectorise oil spills (Class 1) - primary input to drift & attribution.

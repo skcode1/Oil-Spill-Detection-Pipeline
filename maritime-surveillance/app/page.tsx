@@ -291,7 +291,7 @@ export default function MaritimeDashboard() {
     : null;
   const scenePreviewUrl = inputMode === "upload" ? uploadPreview : null;
 
-  const defaultLocation = { lat: 25.9527, lon: 53.3438, name: "Persian Gulf – Offshore Corridor" };
+  const defaultLocation = { lat: 20.0, lon: 0.0, name: "Open Ocean" };
   const hasCentroid = geoStats?.centroid_lat != null && geoStats?.centroid_lon != null;
   const mapCenter: [number, number] = hasCentroid
     ? [Number(geoStats!.centroid_lat), Number(geoStats!.centroid_lon)]
@@ -571,6 +571,7 @@ export default function MaritimeDashboard() {
               showSpill={showSpill}
               showVessel={showVessel}
               center={mapCenter}
+              regionLabel={locationTitle}
             />
           </div>
         </div>
@@ -611,7 +612,7 @@ export default function MaritimeDashboard() {
               <div className="space-y-2 text-xs text-slate-300">
                 <p>
                   <span className="text-slate-500">Location Name:</span>{" "}
-                  <strong className="text-white">{geoStats.location_name || "Persian Gulf TSS"}</strong>
+                  <strong className="text-white">{geoStats.location_name || "Open Ocean"}</strong>
                 </p>
                 <p>
                   <span className="text-slate-500">Centroid:</span>{" "}
