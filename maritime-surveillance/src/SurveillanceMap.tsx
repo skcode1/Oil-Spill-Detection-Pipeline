@@ -37,7 +37,7 @@ const createPulseIcon = (color: string) => {
   });
 };
 
-// Safe control manager to inject scale and handle size recalculations
+
 function MapControlsManager() {
   const map = useMap();
 
@@ -116,19 +116,19 @@ export default function SurveillanceMap({
     return () => setIsMounted(false);
   }, []);
 
-  // Fit the map to the scene bounds whenever a new dossier arrives
+  
   useEffect(() => {
     if (!mapRef.current || !sceneBounds) return;
     try {
       mapRef.current.fitBounds(
         [
-          [sceneBounds[1], sceneBounds[0]], // [min_lat, min_lon]
-          [sceneBounds[3], sceneBounds[2]], // [max_lat, max_lon]
+          [sceneBounds[1], sceneBounds[0]], 
+          [sceneBounds[3], sceneBounds[2]], 
         ],
         { padding: [40, 40] }
       );
     } catch {
-      // fitBounds can fail if bounds are degenerate; fall back to center
+      
     }
   }, [sceneBounds]);
 
@@ -207,7 +207,7 @@ export default function SurveillanceMap({
         isFullscreen ? "fixed inset-0 z-50 rounded-none border-none" : ""
       }`}
     >
-      {/* Top HUD Bar */}
+      {}
       <div className="absolute top-3 left-3 z-[1000] flex items-center gap-2 bg-slate-900/90 backdrop-blur-md px-3.5 py-1.5 rounded-lg border border-slate-700/60 shadow-lg pointer-events-auto">
         <Compass className="w-4 h-4 text-indigo-400 animate-spin" />
         <span className="text-xs font-mono font-semibold tracking-wider text-slate-200">
@@ -225,7 +225,7 @@ export default function SurveillanceMap({
         <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1"></span>
       </div>
 
-      {/* Action Controls */}
+      {}
       <div className="absolute top-3 right-3 z-[1000] flex items-center gap-1.5 bg-slate-900/90 backdrop-blur-md p-1 rounded-lg border border-slate-700/60 shadow-lg pointer-events-auto">
         <button
           onClick={() => setIsFullscreen(!isFullscreen)}
@@ -250,7 +250,7 @@ export default function SurveillanceMap({
       >
         <MapControlsManager />
 
-        {/* Free, Keyless Basemap Layers */}
+        {}
         <LayersControl position="bottomright">
           <LayersControl.BaseLayer checked name="OpenStreetMap Standard">
             <TileLayer
@@ -301,7 +301,7 @@ export default function SurveillanceMap({
         )}
       </MapContainer>
 
-      {/* Global CSS Inject */}
+      {}
       <style jsx global>{`
         .leaflet-container {
           background-color: #0b0f19 !important;

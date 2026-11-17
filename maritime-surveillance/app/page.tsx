@@ -240,7 +240,7 @@ export default function MaritimeDashboard() {
   const sceneMeta = detection?.scene ?? null;
   const stats = detection?.statistics ?? null;
 
-  // Exact 3-Way Classification State
+  
   const rawStatus = pipelineState?.spill_status || detection?.status || "No Oil";
   const isNoOil = rawStatus === "No Oil" || rawStatus === "No Spill Detected";
   const isLookalike = rawStatus === "Lookalike" || Boolean(detection?.is_lookalike);
@@ -305,7 +305,7 @@ export default function MaritimeDashboard() {
     ? `${Number(geoStats!.centroid_lat).toFixed(4)}°N, ${Number(geoStats!.centroid_lon).toFixed(4)}°E`
     : `${defaultLocation.lat.toFixed(4)}°N, ${defaultLocation.lon.toFixed(4)}°E`;
 
-  // Status-dependent tone and accent mapping
+  
   const getStatusBadgeConfig = () => {
     if (isNoOil) {
       return {
@@ -363,7 +363,7 @@ export default function MaritimeDashboard() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.18),_transparent_30%),radial-gradient(circle_at_bottom_right,_rgba(14,165,233,0.12),_transparent_28%),linear-gradient(135deg,#040816_0%,#091120_32%,#0c1424_100%)] text-slate-100 font-sans">
-      {/* 1. SIDEBAR CONTROLLER */}
+      {}
       <aside className="w-[310px] border-r border-white/10 bg-slate-950/60 backdrop-blur-xl p-5 flex flex-col justify-between shadow-[0_0_30px_rgba(15,23,42,0.7)]">
         <div className="space-y-6">
           <div className="flex items-center justify-between rounded-2xl border border-indigo-500/20 bg-indigo-500/5 px-3 py-3">
@@ -511,7 +511,7 @@ export default function MaritimeDashboard() {
         </button>
       </aside>
 
-      {/* 2. MAIN COCKPIT & MAP */}
+      {}
       <main className="flex-1 overflow-hidden p-6">
         <div className="flex h-full flex-col gap-4">
           <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-slate-950/45 px-5 py-4 shadow-[0_10px_40px_rgba(15,23,42,0.35)] backdrop-blur-xl">
@@ -583,7 +583,7 @@ export default function MaritimeDashboard() {
         </div>
       </main>
 
-      {/* 3. INCIDENT DOSSIER PANE */}
+      {}
       <aside className="w-[320px] border-l border-white/10 bg-slate-950/60 p-5 backdrop-blur-xl">
         <div className="space-y-5">
           <div>

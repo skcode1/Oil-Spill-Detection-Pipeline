@@ -77,10 +77,10 @@ useEffect(() => {
       
       if (!res.ok) throw new Error("Failed to fetch alerts");
       const data = await res.json();
-      // TODO: Update your state here with data
+      
       
     } catch (err: any) {
-      // Ignore AbortError so it doesn't crash the development overlay
+      
       if (err.name === 'AbortError') {
         console.log('Fetch aborted');
         return;
@@ -91,7 +91,7 @@ useEffect(() => {
 
   loadAlerts();
 
-  // Cleanup function that triggers the abort
+  
   return () => {
     abortController.abort();
   };
@@ -122,7 +122,7 @@ useEffect(() => {
       setDispatchStatus("DISPATCHED");
     } catch (err) {
       console.error(err);
-      // fallback: allow demo mode to simulate dispatch
+      
       setDispatchStatus("DISPATCHED");
     }
   };
@@ -154,7 +154,7 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(239,68,68,0.15),_transparent_40%),linear-gradient(135deg,#030712_0%,#090d16_50%,#0c1424_100%)] text-slate-100 font-sans p-6">
       
-      {/* Top Navigation */}
+      {}
       <div className="max-w-7xl mx-auto flex items-center justify-between pb-6 border-b border-white/10">
         <div className="flex items-center gap-4">
           <Link
@@ -180,10 +180,10 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
 
       <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6 mt-6">
         
-        {/* LEFT COLUMN: Signal Configuration & Authority Routing */}
+        {}
         <div className="col-span-12 lg:col-span-5 space-y-6">
           
-          {/* Target Jurisdiction Card */}
+          {}
           <div className="bg-slate-950/70 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-xl">
             <h2 className="text-xs uppercase font-bold tracking-widest text-slate-400 mb-4 flex items-center gap-2">
               <MapPin className="w-4 h-4 text-rose-400" /> Target Enforcement Authority
@@ -221,13 +221,13 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
             </div>
           </div>
 
-          {/* Broadcast Parameter Selector */}
+          {}
           <div className="bg-slate-950/70 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-xl space-y-4">
             <h2 className="text-xs uppercase font-bold tracking-widest text-slate-400 flex items-center gap-2">
               <Volume2 className="w-4 h-4 text-indigo-400" /> Transmission Channels
             </h2>
 
-            {/* Alert Severity */}
+            {}
             <div className="space-y-1.5">
               <label className="text-[10px] uppercase font-semibold text-slate-400">Alert Urgency Level</label>
               <div className="grid grid-cols-3 gap-2">
@@ -251,7 +251,7 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
               </div>
             </div>
 
-            {/* Channels */}
+            {}
             <div className="space-y-2 pt-2">
               <label className="text-[10px] uppercase font-semibold text-slate-400">Targeted Dispatch Protocols</label>
               {[
@@ -275,7 +275,7 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
               ))}
             </div>
 
-            {/* Transmit Trigger */}
+            {}
             <button
               onClick={handleTransmitSignal}
               disabled={dispatchStatus === "TRANSMITTING" || dispatchStatus === "DISPATCHED"}
@@ -299,7 +299,7 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
           </div>
         </div>
 
-        {/* RIGHT COLUMN: Official Generated POLREP Payload */}
+        {}
         <div className="col-span-12 lg:col-span-7 space-y-6">
           <div className="bg-slate-950/80 border border-slate-800/80 rounded-2xl p-6 shadow-2xl backdrop-blur-xl flex flex-col h-full justify-between">
             <div>
@@ -313,13 +313,13 @@ CHANNELS   : ${selectedChannels.map((c) => DISPATCH_CHANNELS.find((d) => d.id ==
                 <span className="text-[10px] font-mono text-slate-500">FORMAT: IMO / NTRO / WMO 306</span>
               </div>
 
-              {/* Monospace POLREP Box */}
+              {}
               <div className="mt-4 p-4 rounded-xl bg-slate-900/90 border border-slate-800 font-mono text-xs text-emerald-400 whitespace-pre-wrap leading-relaxed overflow-x-auto shadow-inner">
                 {polrepText}
               </div>
             </div>
 
-            {/* Attributed Culprit Highlights */}
+            {}
             <div className="mt-6 pt-4 border-t border-slate-800 grid grid-cols-3 gap-3 text-xs">
               <div className="bg-slate-900/60 border border-slate-800 p-3 rounded-xl">
                 <span className="text-slate-500 block text-[10px] uppercase">Primary Vessel</span>
